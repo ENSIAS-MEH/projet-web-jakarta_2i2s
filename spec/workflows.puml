@@ -1,0 +1,586 @@
+@startuml SecBret_Scan_Workflow
+title Sequence: On-Demand URL Scanning
+
+actor User
+participant "REST API\n(ScanResource)" as API
+participant "ScanService\n(CDI Service)" as Orchestrator
+participant "ManagedExecutorService\n(Async)" as Executor
+participant "Tier1Scanner\n(Passive)" as T1
+participant "Tier2Scanner\n(Active HTML)" as T2
+participant "Tier3Scanner\n(Vuln Match)" as T3
+database "PostgreSQL" as DB
+
+User -> API: POST /api/v1/scan\n{url: "...", depth: "deep"}
+API -> API: Validate Session
+API -> API: Validate CSRF Token
+API -> API: Validate URL\n(block private IPs)
+API -> Orchestrator: submit(url, depth, userId)
+
+Orchestrator -> DB: INSERT ScannedUrl\n(if not exists)
+
+alt Existing PENDING/RUNNING job for this URL
+Orchestrator -> DB: SELECT scanned_url\nFOR UPDATE WHERE id = urlId
+note right: C2 FIX — row-level lock serialises all\nconcurrent submits for the same URL.\nHeld until @Transactional commits.\nPrevents race where two callers both\nUPDATE to SUPERSEDED then both INSERT,\nleaving superseded_by unset on the winner.
+Orchestrator -> DB: UPDATE ScanJob\nSET status='SUPERSEDED'\nWHERE url_id=? AND status IN ('PENDING','RUNNING')\nRETURNING id AS supersededJobId
+note right: Mark previous active scan SUPERSEDED\n(distinct from FAILED — intentional replacement,\nnot an error; avoids analytics confusion)
+end
+
+Orchestrator -> DB: INSERT ScanJob (status=PENDING)\nnote right: Create new scan.\nThe V20 trigger link_superseded_scan_job\nfires AFTER INSERT and automatically\nsets superseded_by = newJobId\non the SUPERSEDED job — no step 4\nrequired in application code.
+
+note over DB: C2 layer 2 — trigger\nlink_superseded_scan_job\nautomatically links superseded_by\nwithin the same INSERT transaction.\nApplication must NOT duplicate this\nin step 4 (dead code, remove it).
+
+Orchestrator --> API: {jobId: "uuid"}
+API --> User: 202 Accepted\n{jobId: "uuid", status: "PENDING"}
+
+Orchestrator -> Executor: executor.submit
+note right: @ManagedExecutorService\n@Asynchronous
+
+group Async Scan Execution
+Executor -> DB: UPDATE ScanJob\n(status=RUNNING)
+
+Executor -> T1: scan(url)
+activate T1
+T1 -> T1: DNS lookup, WHOIS query,\nSSL cert check, HTTP headers
+T1 --> Executor: Tier1Findings
+deactivate T1
+
+alt depth == DEEP
+Executor -> T2: scan(url)
+activate T2
+note right: jsoup, 5MB limit,\n5s timeout, no JS exec
+T2 --> Executor: Tier2Findings
+deactivate T2
+
+Executor -> T3: scan(tier1, tier2)
+activate T3
+T3 -> T3: Match against CVE patterns,\noutdated library signatures,\nmisconfiguration rules
+T3 --> Executor: Tier3Findings
+deactivate T3
+end
+
+Executor -> DB: INSERT ScanResult\n(aggregated findings)
+Executor -> DB: UPDATE ScanJob\n(status=COMPLETED)
+end
+
+User -> API: GET /api/v1/scan/{jobId}
+API -> DB: SELECT ScanJob, ScanResult
+API --> User: 200\n{jobId, status, scanResult}
+
+@enduml
+
+
+@startuml SecBret_Scan_Race_Condition
+title Sequence: Concurrent Scan Submission Race Condition
+
+actor UserA
+actor UserB
+participant "ScanResource" as API
+participant "ScanService" as Orch
+database "PostgreSQL" as DB
+
+== Request A arrives first ==
+
+UserA -> API: POST /api/v1/scan {url: "X", depth: "DEEP"}
+API -> Orch: submit(url, depth, userIdA)
+Orch -> DB: INSERT ScanJob (url_id=X, status=PENDING)
+Orch --> API: {jobId: A}
+API --> UserA: 202 Accepted {jobId: A}
+Orch -> Orch: executor.submit(async scan for A)
+
+== Request B arrives concurrently ==
+
+UserB -> API: POST /api/v1/scan {url: "X", depth: "QUICK"}
+API -> Orch: submit(url, depth, userIdB)
+
+par Both in same @Transactional boundary (C2 FIX applied)
+Orch -> DB: SELECT scanned_url\nFOR UPDATE WHERE id = X
+note right: C2 FIX — Row-level lock acquired.\nRequest C (if any) blocks here until B commits.\nThis eliminates the race: only one caller\ncan run the supersede+insert sequence at a time.
+Orch -> DB: UPDATE ScanJob SET status='SUPERSEDED'\nWHERE url_id=X AND status IN ('PENDING','RUNNING')\nRETURNING id AS supersededJobId
+note right: Succeeds: job A marked SUPERSEDED\n(not FAILED — intentional replacement, not an error)
+Orch -> DB: INSERT ScanJob (url_id=X, status=PENDING)
+note right: Succeeds: the FOR UPDATE lock means\nno other transaction can hold the active-job\nslot between the UPDATE and this INSERT.\nConstraintViolationException is now a last-resort\nsafety net, not the primary concurrency mechanism.
+DB --> Orch: AFTER INSERT trigger fires\n(link_superseded_scan_job)
+note right: C2 layer 2 — trigger sets\nsuperseded_by = newJobId on the\nSUPERSEDED job automatically.\nApplication step 4 is dead code\nand must be removed.
+Orch --> API: {jobId: B}
+API --> UserB: 202 Accepted
+end
+
+== Request A completes ==
+
+Orch -> DB: UPDATE ScanJob A\n(no-op: status already SUPERSEDED from B's UPDATE)
+note right: Job A was marked SUPERSEDED by B's preemptive UPDATE.\nThe async executor sees terminal state and skips processing.
+
+@enduml
+
+
+@startuml SecBret_Incident_Workflow
+title Sequence: Incident Reporting & Human-in-the-Loop
+
+actor User
+actor "Security Analyst" as Analyst
+participant "REST API\n(IncidentResource)" as API
+participant "IncidentService" as IRS
+participant "ManagedExecutorService\n(Async)" as Executor
+participant "ThreatAnalyzer" as AI
+participant "RulesEngine\n(Java)" as Rules
+participant "ML Sidecar\n(Python gRPC)" as ML
+participant "SecurityTeamReviewService" as RVS
+database "PostgreSQL" as DB
+
+User -> API: POST /api/v1/incident\n{url, evidenceDescription, evidenceUrls}
+API -> API: Validate Session
+API -> API: Validate CSRF Token
+API -> API: Apply Rate Limit
+
+API -> IRS: submitReport(url, evidence, userId)
+IRS -> DB: INSERT / SELECT ScannedUrl
+IRS -> DB: INSERT UserReport(status=PENDING)
+IRS -> Executor: executor.submit\n(after @Transactional commit — split-tx pattern)
+IRS --> API: {reportId, status: "PENDING"}
+API --> User: 202 Accepted\n{reportId, status: "PENDING"}
+
+group Async Analysis (ManagedExecutorService)
+Executor -> DB: SELECT latest ScanResult for URL
+Executor -> AI: analyze(scanResult, userReport)
+
+group SecBret AI Analysis
+AI -> Rules: runRules(scanResult, userReport)
+Rules -> Rules: Domain age check
+Rules -> Rules: SSL validity check
+Rules -> Rules: HTTP security headers check
+Rules -> Rules: Known phishing kit detection\n(Tier 3 markers)
+Rules -> Rules: Suspicious form action check
+Rules -> Rules: URL homoglyph detection
+Rules -> Rules: Hidden iframe check
+Rules -> Rules: Redirect anomaly check
+
+alt Stage 1 — dispositive signal fired (knownPhishingKit)
+note right: Only a dispositive-eligible Tier 3 marker\n(near-zero-FP by construction; kitRulesetVersion\nrecorded per analysis — see Part II §7\nPhishing-Kit Marker Governance)\nmay set knownPhishingKit = true.
+Rules --> AI: ruleScore = 1.0 (override)
+else Stage 2 — weighted average
+Rules --> AI: ruleScore = Σ(weight × value) / 1.30
+note right: Ceiling is 0.827 by design:\nan accumulation of weak signals can\nNEVER reach the 0.95 auto-block gate.\nAuto-block requires a dispositive signal.
+end
+
+alt 0.05 < ruleScore < 0.95 (ML consultation zone)
+note right: ML is consulted only when the\nrules engine is uncertain.
+AI -> ML: classify(scanData, reportData)
+note right: gRPC call to Python sidecar.\nCircuit breaker guards this call:\n5 errors/60s → OPEN (skip ML, rules-only)\n30s cooldown → HALF-OPEN.\nHALF-OPEN: exactly 1 probe admitted via\natomic CAS; concurrent callers fast-fail\nto rules-only.\n\nFail-safe on ML outage: rules-only\nnon-dispositive scores stay < 0.95, so\nuncertain scans land in PENDING_REVIEW —\nnever a silent auto-verdict. The dispositive\noverride still fires without the sidecar.
+ML --> AI: mlScore
+AI -> AI: combinedScore = (ruleScore * 0.4) + (mlScore * 0.6)
+else
+note right: ruleScore <= 0.05 (clearly benign) or\nruleScore >= 0.95 (dispositive override only —\nthe weighted average tops out at 0.827)\n→ ML cannot change disposition
+AI -> AI: combinedScore = ruleScore
+end
+end
+
+note right: Auto-action thresholds applied to combinedScore:\n>= 0.95 → VERIFIED_MALICIOUS (reachable only via\n           the Stage 1 dispositive override)\n<= 0.05 → VERIFIED_BENIGN\n(0.05, 0.95) → PENDING_REVIEW\n\nAuto verdicts apply ONLY when scan data is available.\nA degraded report (unfetchable URL, no scan data)\nALWAYS → PENDING_REVIEW — never auto-cleared.
+AI -> DB: INSERT SecBretAnalysis\n(score, verdict, reasoningChain)
+
+alt combinedScore >= 0.95
+AI -> DB: UPDATE UserReport\n(status=VERIFIED, verdict=VERIFIED_MALICIOUS, resolved_at=NOW())
+AI -> DB: UPDATE ScannedUrl\n(community_verdict=MALICIOUS)
+note right: User discovers via\nGET /api/v1/incident/{reportId} poll
+
+else combinedScore <= 0.05
+AI -> DB: UPDATE UserReport\n(status=VERIFIED, verdict=VERIFIED_BENIGN, resolved_at=NOW())
+AI -> DB: UPDATE ScannedUrl\n(community_verdict=BENIGN)
+note right: User discovers via\nGET /api/v1/incident/{reportId} poll
+
+else 0.05 < combinedScore < 0.95
+AI -> DB: UPDATE UserReport\n(status=PENDING_REVIEW)
+note right: SecurityTeamReview created\nONLY for uncertain cases\n(cardinality: 0..1)
+note over DB: Report appears in\nAnalyst review queue\nUser polls GET /api/v1/incident/{reportId}
+
+Analyst -> API: GET /api/v1/admin/reviews/pending
+API -> RVS: getPendingReviews()
+RVS -> DB: SELECT ... WHERE status=PENDING_REVIEW
+RVS --> Analyst: [pending reports]
+
+Analyst -> API: POST /api/v1/admin/reviews/{reportId}\n{action, finalVerdict?, notes}
+API -> RVS: submit(reportId, analystId, action, finalVerdict, notes)
+
+alt action == APPROVE
+RVS -> DB: INSERT SecurityTeamReview\n(status=APPROVED, finalVerdict=derived_from_threat_score, reviewed_at=NOW())
+note right: If analysis.threat_score >= 0.50 → VERIFIED_MALICIOUS\nElse → VERIFIED_BENIGN\nthreshold is 0.50 (configurable via AUTO_APPROVE_ANALYST_THRESHOLD env var)
+RVS -> DB: UPDATE UserReport\n(status=VERIFIED, verdict=derived_from_threat_score, resolved_at=NOW())
+RVS -> DB: UPDATE ScannedUrl\n(community_verdict=derived_from_AI_verdict)
+else action == REJECT
+RVS -> DB: INSERT SecurityTeamReview\n(status=REJECTED, finalVerdict=REJECTED, reviewed_at=NOW())
+RVS -> DB: UPDATE UserReport\n(status=REJECTED, verdict=REJECTED, resolved_at=NOW())
+note right: No community_verdict set on REJECT
+else action == MODIFY
+RVS -> DB: INSERT SecurityTeamReview\n(status=MODIFIED, finalVerdict=analyst_supplied_verdict, reviewed_at=NOW())
+RVS -> DB: UPDATE UserReport\n(status=VERIFIED, verdict=analyst_supplied_verdict, resolved_at=NOW())
+RVS -> DB: UPDATE ScannedUrl\n(community_verdict=derived_from_final_verdict)
+end
+RVS --> Analyst: 200 {reviewId}
+end
+
+end
+
+@enduml
+
+
+@startuml SecBret_Report_Workflow
+title Sequence: Async PDF Report Generation
+
+actor User
+participant "MVC Controller" as Ctrl
+participant "ReportGenerationService" as RGS
+participant "ManagedExecutorService" as Executor
+participant "OpenPDF Generator" as PDF
+database "PostgreSQL" as DB
+
+User -> Ctrl: POST /api/v1/report-jobs/{urlId}
+Ctrl -> Ctrl: Validate Session
+Ctrl -> Ctrl: Validate CSRF Token
+Ctrl -> Ctrl: Apply Rate Limit
+Ctrl -> RGS: generateReport(urlId, userId)
+
+RGS -> DB: SELECT ScannedUrl
+alt ScannedUrl not found
+RGS --> Ctrl: 404 Not Found
+Ctrl --> User: 404
+end
+
+RGS -> DB: INSERT ReportJob (status=PENDING)
+RGS --> Ctrl: 202 {jobId}
+Ctrl --> User: 202 Accepted\n{jobId: "uuid", status: "PENDING"}
+
+RGS -> Executor: @Asynchronous submit
+
+group Async Report Generation
+Executor -> DB: UPDATE ReportJob\n(status=GENERATING)
+
+Executor -> DB: SELECT latest ScanResult,\nSecBretAnalysis, SecurityTeamReview
+note right: Full aggregation of\nScan + AI + Human review
+
+Executor -> PDF: generate(data)
+activate PDF
+PDF -> PDF: Render Page 1\n(Score + Verdict + Summary)
+PDF -> PDF: Render Page 2\n(Executive Summary +\nSecBret Reasoning Chain)
+PDF -> PDF: Render Page 3\n(Technical Findings +\nReview Notes)
+PDF --> Executor: pdfBytes
+deactivate PDF
+
+alt PDF generation succeeded
+Executor -> DB: UPDATE ReportJob\n(status=COMPLETED, file_data, file_size_bytes, completed_at=NOW())
+Executor -> DB: INSERT ShareLink\n(uuid_token, expires_at=now+30d)
+note right: Auto-created share link\nwith default 30-day expiry
+else PDF generation failed
+Executor -> DB: UPDATE ReportJob\n(status=FAILED, error_message='OpenPDF rendering error: ...')
+end
+end
+
+User -> Ctrl: GET /api/v1/report-jobs/{jobId}
+Ctrl -> DB: SELECT ReportJob
+alt status == COMPLETED
+Ctrl --> User: 200 {jobId, status: "COMPLETED", shareLink: {...}, fileSizeBytes}
+else status == GENERATING
+Ctrl --> User: 200 {jobId, status: "GENERATING"}
+end
+
+User -> Ctrl: GET /share/{uuid}
+Ctrl -> DB: SELECT ShareLink WHERE uuid_token AND not expired AND not revoked
+alt Valid link
+Ctrl -> DB: SELECT file_data FROM ReportJob\nWHERE id = shareLink.report_job_id
+Ctrl -> DB: UPDATE ShareLink\nSET access_count = access_count + 1,\nlast_accessed_at = NOW()
+Ctrl --> User: 200 OK\nContent-Type: application/pdf\n(streamed from DB BLOB)
+else Expired or Revoked
+Ctrl --> User: 410 Gone
+end
+
+@enduml
+
+
+@startuml SecBret_GDPR_Deletion
+title Sequence: GDPR Account Deletion (Hard DELETE with Audit Tombstone)
+actor User
+participant "AuthResource\n(DELETE /auth/me)" as Ctrl
+participant "UserService" as USvc
+participant "AuditLogService" as Audit
+database "PostgreSQL" as DB
+
+User -> Ctrl: DELETE /api/v1/auth/me\n{currentPassword: "..."}
+Ctrl -> USvc: deleteAccount(userId, currentPassword)
+USvc -> USvc: validate currentPassword
+USvc -> DB: SELECT secbret_user WHERE id=:userId
+
+group @Transactional boundary (CRITICAL ordering)
+    ' NOTE: The SELECT below is optional in v1; V20 tombstone trigger handles ordering.
+    ' Kept here for clarity, but trigger is the single source of truth.
+    USvc -> Audit: log(ACCOUNT_DELETED, userId, null, "secbret_user", {userId})
+    Audit -> DB: INSERT INTO audit_log\n(actor_id, actor_username, action, target_type, target_id)\nVALUES (:userId, :username, 'ACCOUNT_DELETED', 'secbret_user', :userId)
+    
+    note right
+        Step 1a: INSERT new audit record for this deletion event.
+        NOTE: Step 1b (manual tombstoning UPDATE) removed — superseded by V20 trigger.
+        The trigger `tombstone_audit_before_delete` fires BEFORE DELETE
+        and writes actor_username = 'deleted_{uuid}' on all rows where actor_id = :userId.
+        See Part IV §V20 DDL for trigger definition.
+    end note
+    
+    USvc -> DB: DELETE FROM secbret_user WHERE id = :userId
+    
+    note right
+        Step 2: Hard DELETE fires: (a) ON DELETE SET NULL cascades, and
+        (b) V20 trigger `tombstone_audit_before_delete` writes tombstone BEFORE the
+        FK cascade nullifies actor_id. Single source of truth — no application-level
+        UPDATE needed. CASCADE deletes password_reset_token,
+        idempotency_key, webhook_subscription.
+    end note
+end
+
+USvc --> Ctrl: 204 No Content
+Ctrl --> User: 204
+@enduml
+
+
+@startuml SecBret_Admin_UserMgmt
+title Sequence: Admin User Management
+
+actor Admin
+participant "AdminWebController" as Ctrl
+participant "UserService" as USvc
+participant "AuditLogService" as Audit
+database "PostgreSQL" as DB
+
+== List Users ==
+
+Admin -> Ctrl: GET /api/v1/admin/users?role=...&page=1
+Ctrl -> USvc: listUsers(role, enabled, page, size)
+USvc -> DB: SELECT FROM secbret_user ...\n(where clause filters)
+USvc --> Ctrl: Page<AdminUserDTO>
+Ctrl --> Admin: 200 {users: [...], totalElements, ...}
+
+== Get Single User ==
+
+Admin -> Ctrl: GET /api/v1/admin/users/{userId}
+Ctrl -> USvc: getUser(userId)
+USvc -> DB: SELECT FROM secbret_user WHERE id=:userId
+USvc --> Ctrl: AdminUserDTO
+Ctrl --> Admin: 200 {id, username, email, role, enabled, lockedUntil, ...}
+
+== Change Role ==
+
+Admin -> Ctrl: PUT /api/v1/admin/users/{userId}/role\n{role: "ANALYST"}
+Ctrl -> USvc: changeRole(targetUserId, newRole, adminId)
+USvc -> DB: UPDATE secbret_user SET role=:newRole\nWHERE id=:targetUserId
+USvc -> Audit: log(ROLE_CHANGED, adminId, targetUserId,\n"secbret_user", {oldRole, newRole})
+note right: Audit logged inside same\n@Transactional as the role change.\nIf audit insert fails → rollback.
+USvc --> Ctrl: AdminUserDTO
+Ctrl --> Admin: 200 {id, username, role: "ANALYST"}
+
+== Enable / Disable ==
+
+Admin -> Ctrl: PUT /api/v1/admin/users/{userId}/status\n{enabled: false}
+Ctrl -> USvc: changeStatus(targetUserId, false, adminId)
+alt targetUserId == adminId
+USvc --> Ctrl: throw ConflictException("Cannot disable self")
+Ctrl --> Admin: 409 Conflict
+else targetUserId != adminId
+USvc -> DB: UPDATE secbret_user SET enabled=false\nWHERE id=:targetUserId
+USvc -> Audit: log(USER_DISABLED, adminId, targetUserId,\n"secbret_user", {userId})
+USvc --> Ctrl: AdminUserDTO
+Ctrl --> Admin: 200 {id, username, enabled: false}
+end
+
+== Unlock Account ==
+
+Admin -> Ctrl: PUT /api/v1/admin/users/{userId}/unlock
+Ctrl -> USvc: unlockAccount(targetUserId)
+USvc -> DB: UPDATE secbret_user\nSET failed_login_attempts=0, locked_until=NULL\nWHERE id=:targetUserId
+USvc --> Ctrl: AdminUserDTO (lockedUntil: null, failedLoginAttempts: 0)
+Ctrl --> Admin: 200 {id, username, enabled: true,\nlockedUntil: null, failedLoginAttempts: 0}
+
+@enduml
+
+
+@startuml SecBret_Auth_Workflow
+title Sequence: Authentication & Authorization Flow
+
+actor User
+participant "SecurityFilter\n(Soteria)" as Filter
+participant "IdentityStore\n(DB)" as IDStore
+participant "RateLimitFilter" as RL
+participant "SecurityHeaderFilter" as SH
+participant "Controller" as Ctrl
+database "PostgreSQL" as DB
+
+== Request Interception ==
+
+User -> SH: GET /any-resource
+SH -> SH: Add CSP header
+SH -> SH: Add X-Frame-Options: DENY
+SH -> SH: Add X-Content-Type-Options: nosniff
+SH -> SH: Add Strict-Transport-Security: max-age=31536000
+SH -> User: (all responses include security headers)
+
+== Rate Limiting ==
+
+User -> RL: POST /api/v1/scan
+RL -> RL: Check IP rate (10 req/hour)
+alt Rate exceeded
+RL --> User: 429 Too Many Requests
+note right: Retry-After: 3600
+end
+
+== Authentication ==
+
+User -> Filter: POST /login\n{username, password}
+Filter -> IDStore: validate(username, password)
+IDStore -> DB: SELECT ... WHERE username AND enabled
+alt Invalid credentials
+Filter --> User: 401 / redirect login?error
+else Valid
+Filter -> Filter: Create HttpAuthenticationMechanism
+Filter -> Filter: Set session with roles
+Filter --> User: 302 redirect to dashboard
+end
+
+== RBAC Authorization ==
+
+User -> Filter: GET /admin/reviews
+Filter -> Filter: Check @RolesAllowed("ANALYST", "ADMIN")
+alt Not authorized
+Filter --> User: 403 Forbidden
+else Authorized
+Filter -> Ctrl: forward request
+Ctrl --> User: Dashboard page
+end
+
+@enduml
+
+
+@startuml SecBret_ShareLink_Access
+title Sequence: UUID Share Link Access (Anonymous)
+
+actor "Anyone\n(with link)" as Anon
+participant "MVC Controller\n(ReportController)" as Ctrl
+participant "ShareLinkService" as SLS
+database "PostgreSQL" as DB
+
+Anon -> Ctrl: GET /share/{uuid}
+Ctrl -> SLS: accessShareLink(uuid)
+
+SLS -> DB: SELECT ShareLink\nJOIN ReportJob WHERE uuid_token
+
+alt Link not found
+SLS --> Ctrl: null
+Ctrl --> Anon: 404 Not Found
+
+else Link is revoked
+SLS --> Ctrl: revoked
+Ctrl --> Anon: 410 Gone\n"This report has been revoked"
+
+else Link expired (now > expires_at)
+SLS --> Ctrl: expired
+Ctrl --> Anon: 410 Gone\n"This report link has expired"
+
+else Valid link
+SLS -> DB: UPDATE ShareLink\nSET access_count = access_count + 1,\nlast_accessed_at = NOW()
+SLS --> Ctrl: reportJob
+
+alt Accept: application/pdf
+Ctrl -> DB: SELECT file_data FROM ReportJob\nWHERE id = reportJob.id
+Ctrl --> Anon: 200 OK\nContent-Type: application/pdf\n(streamed from DB BLOB)
+else Accept: application/json (or no Accept header)
+Ctrl --> Anon: 200 OK\nContent-Type: application/json\n{"shareUuid": "...", "url": "...", \"executiveSummary": {...}, \"technicalFindings": {...}}
+end
+
+@enduml
+
+
+@startuml SecBret_HIBP_Check
+title Sequence: Have I Been Pwned Password Check
+
+actor User
+participant "MVC Controller\n(AuthWebController)" as Auth
+participant "UserService" as USvc
+participant "HIBPClient" as HIBP
+database "PostgreSQL" as DB
+
+User -> Auth: POST /register (web form)\nusername, email, password
+Auth -> USvc: register(username, email, password)
+USvc -> HIBP: checkPwnedPassword(passwordPrefix)\nHTTP GET api.pwnedpasswords.com/range/{prefix}
+alt HIBP reachable, password found in breach
+HIBP --> USvc: suffix match found
+USvc --> Auth: throw ValidationException("Password found in known data breach")
+Auth --> User: re-render auth/register.jsp\nwith error model attribute
+else HIBP reachable, no match
+HIBP --> USvc: no match
+USvc -> DB: INSERT secbret_user
+USvc --> Auth: user created
+Auth --> User: 302 → /login?registered
+else HIBP unreachable or timeout (>3s)
+HIBP --> USvc: timeout / IOException
+note right: Fail-open: skip check, allow registration,\nlog WARN server-side (BreachCheckService).\nNo X-HIBP-Check response header in v1 —\nthat header is v2-only (see openapi.yaml\nPOST /auth/register, v2 pre-positioning).
+USvc -> DB: INSERT secbret_user
+USvc --> Auth: user created
+Auth --> User: 302 → /login?registered
+end
+
+@enduml
+
+
+@startuml SecBret_ScanJob_States
+title State Machine: scan_job.status
+
+[*] --> PENDING : POST /api/v1/scan\n(scan submitted)
+
+PENDING --> RUNNING : Executor picks up job
+PENDING --> SUPERSEDED : Newer scan submitted for same URL\n(preemptive UPDATE in @Transactional)
+PENDING --> FAILED : Server restart during PENDING\n(startup recovery batch)
+
+RUNNING --> COMPLETED : All scan tiers finished
+RUNNING --> SUPERSEDED : Newer scan submitted while running\n(executor checks status before writing result)
+RUNNING --> FAILED : IOException / timeout /\nserver restart
+
+SUPERSEDED --> [*] : terminal state; supersededBy\nfield points to the new job
+FAILED --> [*] : terminal state\n(user resubmits new job)
+COMPLETED --> [*] : terminal state
+
+note "Only one PENDING or RUNNING\njob per URL at a time\n(uq_scan_job_active_per_url)\n\nSUPERSEDED ≠ FAILED:\nSUPERSEDED = intentional replacement\nFAILED = error / crash" as N1
+
+@enduml
+
+
+@startuml SecBret_ReportJob_States
+title State Machine: report_job.status
+
+[*] --> PENDING : POST /api/v1/report-jobs/{urlId}
+
+PENDING --> GENERATING : Executor picks up job
+PENDING --> FAILED : Server restart during PENDING\n(startup recovery batch)
+
+GENERATING --> COMPLETED : PDF rendered + share link auto-created
+GENERATING --> FAILED : DocumentException /\nIOException / server restart
+
+FAILED --> [*] : terminal state
+COMPLETED --> [*] : terminal state
+
+@enduml
+
+
+@startuml SecBret_UserReport_States
+title State Machine: user_report.status
+
+[*] --> PENDING : POST /api/v1/incident\n(report submitted)
+
+PENDING --> PENDING_REVIEW : AI analysis complete;\n0.05 < combinedScore < 0.95
+
+PENDING --> VERIFIED : AI auto-approve\n(combinedScore >= 0.95)\nor AI auto-reject\n(combinedScore <= 0.05)
+
+PENDING_REVIEW --> VERIFIED : Analyst APPROVE or MODIFY action
+PENDING_REVIEW --> REJECTED : Analyst REJECT action
+
+PENDING --> FAILED : Async analysis DB write error\n(INSERT INTO secbret_analysis fails)
+
+VERIFIED --> [*] : terminal; community_verdict set
+REJECTED --> [*] : terminal; community_verdict unchanged
+FAILED --> [*] : terminal; no community_verdict set
+
+note "community_verdict on scanned_url:\nVERIFIED (malicious verdict) → MALICIOUS\nVERIFIED (benign verdict)   → BENIGN\nREJECTED (human analyst REJECT) → unchanged\n\nDo NOT conflate the two: auto-resolve to VERIFIED_BENIGN\n(combinedScore <= 0.05, the 'AI auto-reject' edge above) is a\nVERIFIED transition and DOES set community_verdict = BENIGN.\nOnly the human PENDING_REVIEW --> REJECTED transition leaves\ncommunity_verdict unchanged. (See §17 Q2.)" as N1
+
+@enduml

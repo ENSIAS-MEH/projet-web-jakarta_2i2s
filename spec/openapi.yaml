@@ -1,0 +1,2281 @@
+openapi: 3.0.3
+info:
+  title: SecBret - Web Scanner & Incident Reporting System
+  description: |
+    VirusTotal-style URL scanner with hybrid AI verification and human-in-the-loop incident review.
+
+    **Secondary rate-limit backstop:** In addition to any endpoint-specific per-user limits
+    documented in `x-rate-limit` extensions, all authenticated endpoints share a secondary
+    backstop of **30 requests per IP per hour**. This backstop applies globally and is
+    enforced after endpoint-specific limits. Responses include `Retry-After` when either
+    limit is hit. See `api-spec.md` §Rate Limits for the full limits table.
+  version: 1.0.0
+  contact:
+    name: SecBret Team
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: Health
+    description: Liveness and readiness
+  - name: Auth
+    description: Authentication & user management
+  - name: Scan
+    description: URL scanning
+  - name: Incident
+    description: Incident reporting
+  - name: Report Generation
+    description: PDF report generation
+  - name: Share
+    description: UUID share links
+  - name: Admin
+    description: Security team & admin operations
+  - name: Dashboard
+    description: Public dashboard
+
+paths:
+  /health/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe — is the process alive?
+      x-required-role: ANONYMOUS
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Process is unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/ready:
+    get:
+      tags: [Health]
+      summary: Readiness probe — is the application ready to serve traffic?
+      x-required-role: ANONYMOUS
+      responses:
+        '200':
+          description: Application is ready (database connection verified)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Not ready — database unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/dependencies:
+    get:
+      tags: [Health]
+      summary: Dependency health — checks SMTP and ML sidecar availability
+      x-required-role: ANONYMOUS
+      responses:
+        '200':
+          description: All dependencies healthy or degraded-but-serving
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: One or more critical dependencies unreachable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user account (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only. v1 registration is the Jakarta MVC (Krazo) web
+        form at POST /register (application/x-www-form-urlencoded), which responds
+        with a 302 redirect or a re-rendered JSP — never this JSON envelope. The
+        201 body and X-HIBP-Check response header below describe the future v2 JSON
+        contract; neither is emitted in v1 (the HIBP fail-open decision is
+        observable only in server logs in v1). See SPECIFICATION Part III §1.
+      x-required-role: ANONYMOUS
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User created
+          headers:
+            X-HIBP-Check:
+              $ref: '#/components/headers/XHibpCheck'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Authenticate and create session (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only, parallel to the bearerAuth scheme. v1 has no JSON
+        login endpoint: authentication is the Soteria CustomForm web flow at
+        POST /login (form-encoded), which re-presents the login page on failure
+        and never returns 401/403/423. This path is documented so the v2 JSON
+        auth API can be enabled without a contract-breaking change.
+      x-required-role: ANONYMOUS
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      x-rate-limit:
+        limit: 10
+        window: 15m
+        scope: ip
+        key: clientIp
+        description: Per-IP limit (10/15min), separate from per-account lockout.
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Invalidate current session (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only. v1 logout is the Krazo web controller at
+        POST /logout (form flow) which invalidates the HttpSession and issues a
+        302 redirect. See SPECIFICATION Part III §1.
+      x-required-role: AUTHENTICATED
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      responses:
+        '204':
+          description: Session invalidated
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user profile (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only. v1 exposes no JSON GET /auth/me; the current
+        user is rendered server-side into JSP views. Only DELETE /auth/me (GDPR
+        erasure, below) is a real v1 REST endpoint. See SPECIFICATION Part III §1.
+      x-required-role: AUTHENTICATED
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      tags: [Auth]
+      summary: GDPR account deletion — hard delete and cascade anonymisation
+      x-required-role: AUTHENTICATED
+      description: |
+        Permanently deletes the account. Executes a hard DELETE on the
+        `secbret_user` row so that database-level `ON DELETE SET NULL`
+        constraints fire correctly:
+        - `api_token`, `password_reset_token`, `idempotency_key`, `webhook_subscription`
+          are CASCADE DELETED.
+        - `scan_job`, `user_report`, `report_job`, `share_link`,
+          `security_team_review` have their user FKs set to NULL.
+        - `audit_log.actor_id` is set to NULL; the `actor_username` string
+          field retains the `deleted_{uuid}` tombstone for historical context.
+        All active sessions are invalidated.
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmPasswordRequest'
+      responses:
+        '204':
+          description: Account hard-deleted; all sessions invalidated; FKs nullified
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Current password incorrect
+
+  /auth/password/change:
+    put:
+      tags: [Auth]
+      summary: Change password while authenticated (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only. v1 password change is a Krazo web form, not a
+        JSON REST endpoint. See SPECIFICATION Part III §1.
+      x-required-role: AUTHENTICATED
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: Password changed
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Current password incorrect
+
+  # --- Password reset flow ---
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Request a password reset email (v2 pre-positioning — NOT served in v1)
+      x-required-role: ANONYMOUS
+      description: |
+        v2 pre-positioning only — v1 drives this flow through Krazo web forms,
+        not JSON REST. In the future v2 JSON contract this always returns 202 even
+        if the email is unknown, to prevent user enumeration. The reset link (if
+        any) is sent to the registered email; the link is single-use and expires
+        after 1 hour. See SPECIFICATION Part III §1.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgotPasswordRequest'
+      x-rate-limit:
+        limit: 5
+        window: 15m
+        scope: ip
+        key: clientIp
+        description: Maximum 5 forgot-password requests per IP per 15 minutes.
+      responses:
+        '202':
+          description: If the account exists, an email has been sent
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Complete password reset using emailed token (v2 pre-positioning — NOT served in v1)
+      description: >-
+        v2 pre-positioning only. v1 completes password reset via a Krazo web
+        form, not this JSON endpoint. See SPECIFICATION Part III §1.
+      x-required-role: ANONYMOUS
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      x-rate-limit:
+        limit: 5
+        window: 15m
+        scope: ip
+        key: clientIp
+        description: Per-IP limit (5/15min). Token-submission endpoint must be rate-limited as strictly as the forgot-password step to prevent brute-force of emailed tokens.
+      responses:
+        '204':
+          description: Password reset successful
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '410':
+          description: Reset token expired or already used
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # --- 2FA endpoints have been removed per architectural decision ---
+
+  /scan:
+    post:
+      tags: [Scan]
+      summary: Submit a URL for scanning
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScanRequest'
+      x-rate-limit:
+        limit: 10
+        window: 1h
+        scope: user
+        key: userId
+        description: Per-user limit (10/hr). Also subject to secondary per-IP backstop of 30/hr.
+      responses:
+        '202':
+          description: Scan job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanJobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: |
+            Two distinct cases:
+            1. Idempotency-Key reused with a **different** request body — the original request's response cannot be replayed.
+            2. Idempotency-Key reused with the **same** request body but the original request is **still in-flight** — retry after the interval indicated by `Retry-After: 5`.
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      tags: [Scan]
+      summary: List scan jobs
+      x-required-role: REPORTER
+      description: |
+        REPORTERs see their own jobs only. ANALYSTs and ADMINs may pass `all=true`
+        to list across all users. Results sorted by `createdAt DESC`.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ScanJobStatus'
+          description: Filter by job status
+        - name: depth
+          in: query
+          schema:
+            $ref: '#/components/schemas/ScanDepth'
+          description: Filter by scan depth
+        - name: all
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: ANALYST/ADMIN only — return jobs for all users. Returns 403 for REPORTER.
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: List of scan jobs
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - type: object
+                    properties:
+                      scans:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ScanJobResponse'
+                  - $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /scan/{jobId}:
+    get:
+      tags: [Scan]
+      summary: Get scan job status and results
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Scan job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanJobDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Scan job not found or not owned by caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /scan/url/{urlId}:
+    get:
+      tags: [Scan]
+      summary: Get latest consolidated result for a URL
+      x-required-role: REPORTER
+      description: |
+        REPORTERs are restricted to URLs for which they have previously
+        submitted a scan. If a REPORTER queries a urlId they have never
+        scanned, the endpoint returns 404 to prevent data enumeration.
+        ANALYSTs and ADMINs may query any URL.
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: urlId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Latest URL scan result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UrlScanResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /incident:
+    post:
+      tags: [Incident]
+      summary: Submit an incident report
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentReportRequest'
+      x-rate-limit:
+        limit: 5
+        window: 1h
+        scope: user
+        key: userId
+        description: Per-user limit (5/hr). Also subject to secondary per-IP backstop of 30/hr.
+      responses:
+        '202':
+          description: Report accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentReportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: |
+            Two distinct cases:
+            1. Idempotency-Key reused with a **different** request body — the original request's response cannot be replayed.
+            2. Idempotency-Key reused with the **same** request body but the original request is **still in-flight** — retry after the interval indicated by `Retry-After: 5`.
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      tags: [Incident]
+      summary: List own incident reports
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/ReportStatus'
+        - name: all
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: ANALYST/ADMIN only — return reports for all users. Returns 403 for REPORTER.
+      responses:
+        '200':
+          description: Paginated list of incident reports
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /incident/{reportId}:
+    get:
+      tags: [Incident]
+      summary: Get incident report details
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Report details with SecBret analysis
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentReportDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # --- PDF report generation ---
+  /report-jobs/{urlId}:
+    post:
+      tags: [Report Generation]
+      summary: Request async PDF report generation
+      description: |
+        Creates a new report generation job for the scanned URL identified by the path
+        parameter. The response body contains the newly created `jobId` (report job UUID)
+        which should then be used to poll `GET /report-jobs/{jobId}`.
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+        - name: urlId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID of the `scanned_url` record to generate a report for
+      x-rate-limit:
+        limit: 3
+        window: 1h
+        scope: user
+        key: userId
+        description: Per-user limit (3/hr). Also subject to secondary per-IP backstop of 30/hr.
+      responses:
+        '202':
+          description: Report generation job created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportJobResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Two distinct cases:
+            1. Idempotency-Key reused with a **different** request body — the original request's response cannot be replayed.
+            2. Idempotency-Key reused with the **same** request body but the original request is **still in-flight** — retry after the interval indicated by `Retry-After: 5`.
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # NOTE (C1 fix): GET is on a SEPARATE path /report-jobs/{jobId} below.
+  # POST uses {urlId} (the scanned URL to generate a report for).
+  # GET uses {jobId} (the async job UUID returned in the POST response).
+  # They cannot share a path block because the parameter names differ.
+
+  /report-jobs/{jobId}:
+    get:
+      tags: [Report Generation]
+      summary: Poll report generation status
+      description: |
+        Returns the current status of a report generation job.
+
+        **Path parameter:** `{jobId}` is the report job UUID returned in the `jobId`
+        field of the `POST /report-jobs/{urlId}` response. It is NOT the `urlId` of
+        the scanned URL — passing a `urlId` here will return 404.
+
+        REPORTERs may only poll jobs they requested
+        (`report_job.requested_by = authenticatedUserId`); attempting to poll a job
+        owned by another user returns 404. ANALYSTs and ADMINs may poll any job.
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: >
+            UUID of the report generation job to poll. This is the `jobId` value
+            returned by `POST /report-jobs/{urlId}` — NOT the `urlId` of the
+            scanned URL.
+      responses:
+        '200':
+          description: Report job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportJobStatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Report job not found or not owned by caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --- Share links ---
+  /share/{uuid}:
+    get:
+      tags: [Share]
+      summary: Access shared report via UUID
+      x-required-role: ANONYMOUS
+      description: |
+        No authentication required. Response format depends on the Accept
+        header: `application/json` returns summary; `application/pdf`
+        streams the file. The `format=pdf` query parameter forces the PDF
+        regardless of Accept (browser download links cannot set headers).
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          required: false
+          description: Set to `pdf` to force the PDF response from a plain link.
+          schema:
+            type: string
+            enum: [pdf]
+      responses:
+        '200':
+          description: Shared report content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SharedReportResponse'
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+
+    delete:
+      tags: [Share]
+      summary: Revoke a share link
+      x-required-role: AUTHENTICATED
+      description: |
+        Role check in service layer: REPORTER may revoke own links only;
+        ANALYST and ADMIN may revoke any link. Returns 403 if the caller
+        lacks permission for the specific link.
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - name: uuid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Share link revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /share:
+    get:
+      tags: [Share]
+      summary: List own share links
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+      responses:
+        '200':
+          description: Paginated list of share links
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Share]
+      summary: Create a share link for an existing report job
+      x-required-role: REPORTER
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShareLinkCreateRequest'
+      x-rate-limit:
+        limit: 10
+        window: 1h
+        scope: user
+        key: userId
+        description: Per-user limit (10/hr). Also subject to secondary per-IP backstop of 30/hr.
+      responses:
+        '201':
+          description: Share link created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /dashboard/public:
+    get:
+      tags: [Dashboard]
+      summary: Public dashboard of verified URLs
+      x-required-role: ANONYMOUS
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - name: size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 50
+        - name: verdict
+          in: query
+          schema:
+            type: string
+            enum: [MALICIOUS, BENIGN]
+        - name: url
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 2048
+          description: |
+            If provided, returns the single matching entry with its community verdict,
+            or 404 when the URL has no verdict. This is the primary entry point for
+            anonymous users checking a specific URL (no internal urlId required).
+      x-rate-limit:
+        limit: 60
+        window: 1m
+        scope: ip
+        key: clientIp
+        description: Per-IP public dashboard limit (60/min).
+      responses:
+        '200':
+          description: |
+            Public dashboard data. The response shape depends on whether the `url` query parameter is supplied:
+            - Without `?url=`: returns a paginated list (`PublicDashboardResponse`).
+            - With `?url=`: returns a single URL detail object (`PublicUrlDetailResponse`) including `secbretReasoning`, or 404 if the URL has no community verdict.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PublicDashboardResponse'
+                  - $ref: '#/components/schemas/PublicUrlDetailResponse'
+        # 404 only when `?url=` is supplied and the URL has no community verdict
+        # (see the operation and 200 descriptions above).
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /admin/reviews/pending:
+    get:
+      tags: [Admin]
+      summary: List pending incident reviews
+      x-required-role: ANALYST
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+        - name: sortBy
+          in: query
+          schema:
+            type: string
+            enum: [createdAt, threatScore, reportedAt]
+            default: createdAt
+          description: |
+            Sort field for the pending reviews list. `createdAt` sorts by when the
+            `user_report` row was created. `reportedAt` is an alias for `createdAt`
+            (both map to `user_report.created_at`) and is retained for API consumer
+            compatibility; prefer `createdAt` in new integrations.
+        - name: sortOrder
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+      responses:
+        '200':
+          description: Pending reviews list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingReviewsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/reviews/{reportId}:
+    get:
+      tags: [Admin]
+      summary: Get full review details
+      x-required-role: ANALYST
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Full review details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      tags: [Admin]
+      summary: Submit a security team review
+      x-required-role: ANALYST
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewSubmitRequest'
+      responses:
+        '200':
+          description: Review submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewSubmitResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users. Admin only.
+      x-required-role: ADMIN
+      security:
+        - cookieAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/SizeParam'
+        - name: role
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserRole'
+        - name: enabled
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: User list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{userId}/role:
+    put:
+      tags: [Admin]
+      summary: Change a user's role
+      x-required-role: ADMIN
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeRoleRequest'
+      responses:
+        '200':
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users/{userId}/status:
+    put:
+      tags: [Admin]
+      summary: Enable or disable a user
+      x-required-role: ADMIN
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeStatusRequest'
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/users/{userId}/unlock:
+    put:
+      tags: [Admin]
+      summary: Unlock a locked user account
+      x-required-role: ADMIN
+      security:
+        - cookieAuth: []
+          csrfToken: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User unlocked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/users/{userId}:
+    get:
+      tags: [Admin]
+      summary: Get single user profile
+      x-required-role: ADMIN
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserDetailResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    # Web session. Same browser, JSESSIONID set by /auth/login response.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: JSESSIONID
+    # CSRF protection header. Required on all authenticated state-changing requests.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+    # bearerAuth (long-lived machine-to-machine tokens, format: Authorization: Bearer sbr_<random>)
+    # is deferred to v2. No endpoints use it in v1, no self-service provisioning UI exists,
+    # and no YAML security scheme definition is present here. It will be added as a proper
+    # securitySchemes entry when the v2 /auth/tokens endpoints are introduced.
+
+  parameters:
+    PageParam:
+      name: page
+      in: query
+      schema:
+        type: integer
+        default: 1
+        minimum: 1
+    SizeParam:
+      name: size
+      in: query
+      schema:
+        type: integer
+        default: 20
+        maximum: 100
+        minimum: 1
+    # Standardized idempotency header. Used by POST /scan, POST /incident,
+    # and POST /report-jobs/{urlId}. Clients SHOULD send a stable per-request
+    # UUID; replays within the idempotency window return the original response
+    # without re-executing.
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 255
+
+  headers:
+    XCorrelationId:
+      description: Correlation ID echoed from the request (or generated if absent). Include in bug reports.
+      schema:
+        type: string
+        format: uuid
+    XRateLimitLimit:
+      description: Maximum requests allowed in the current window
+      schema:
+        type: integer
+    XRateLimitRemaining:
+      description: Remaining requests in the current window
+      schema:
+        type: integer
+    XRateLimitReset:
+      description: Unix timestamp when the rate limit window resets
+      schema:
+        type: integer
+    XHibpCheck:
+      description: Present on registration responses when HIBP was not consulted (e.g. timeout). Value is always "skipped".
+      schema:
+        type: string
+        enum: [skipped]
+
+  responses:
+    BadRequest:
+      description: Validation error
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Authentication required
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Insufficient permissions
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Conflict (duplicate, already reviewed)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Gone:
+      description: Share link expired or revoked
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Locked:
+      description: Account locked (too many failed login attempts)
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/XRateLimitLimit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/XRateLimitRemaining'
+        X-RateLimit-Reset:
+          $ref: '#/components/headers/XRateLimitReset'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        X-Correlation-Id:
+          $ref: '#/components/headers/XCorrelationId'
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until rate limit resets
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+          description: Maximum requests allowed in the current window
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+          description: Remaining requests in the current window
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+          description: Unix timestamp when the rate limit window resets
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN]
+        checks:
+          type: object
+          properties:
+            database:
+              type: string
+              enum: [UP, DOWN]
+            mlSidecar:
+              type: string
+              enum: [UP, DOWN, DEGRADED]
+            email:
+              type: string
+              enum: [UP, DOWN]
+              description: SMTP connectivity for password reset delivery
+        version:
+          type: string
+
+    ConfirmPasswordRequest:
+      type: object
+      required: [currentPassword]
+      properties:
+        currentPassword:
+          type: string
+
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+        newPassword:
+          type: string
+          minLength: 12
+          maxLength: 128
+          description: |
+            Min 12 characters; no character-class composition requirements.
+            Must differ from currentPassword.
+
+    UserRole:
+      type: string
+      enum: [REPORTER, ANALYST, ADMIN]
+
+    ScanDepth:
+      type: string
+      enum: [QUICK, DEEP]
+
+    ScanJobStatus:
+      type: string
+      enum: [PENDING, RUNNING, COMPLETED, SUPERSEDED, FAILED]
+      description: |
+        SUPERSEDED — job was replaced by a newer scan request for the same URL; see `supersededBy` field.
+        FAILED — scan failed due to timeout, unreachable target, or internal error.
+
+    ReportStatus:
+      type: string
+      enum: [PENDING, PENDING_REVIEW, VERIFIED, REJECTED, FAILED]
+
+    AnalysisVerdict:
+      type: string
+      enum: [BENIGN, SUSPICIOUS]
+      description: Produced by the SecBret AI engine (secbret_analysis.verdict). VERIFIED_MALICIOUS and VERIFIED_BENIGN are stored on user_report.verdict and security_team_review.final_verdict, not on secbret_analysis.
+
+    FinalVerdict:
+      type: string
+      enum: [VERIFIED_MALICIOUS, VERIFIED_BENIGN, REJECTED]
+      description: Produced by human review (security_team_review.final_verdict and user_report.verdict).
+
+    CommunityVerdict:
+      type: string
+      enum: [UNKNOWN, MALICIOUS, SUSPICIOUS, BENIGN]
+      nullable: true
+      description: |
+        UNKNOWN — URL has been seen but no verdict established yet.
+        SUSPICIOUS — under active review; verdict pending.
+        MALICIOUS — verified malicious by security team or AI auto-approval.
+        BENIGN — verified benign by security team or AI auto-rejection.
+        null — no verdict record exists for this URL yet.
+
+    ReviewAction:
+      type: string
+      enum: [APPROVE, REJECT, MODIFY]
+
+    ReportJobStatus:
+      type: string
+      enum: [PENDING, GENERATING, COMPLETED, FAILED]
+
+    ErrorResponse:
+      type: object
+      properties:
+        status:
+          type: integer
+        error:
+          type: string
+        message:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        path:
+          type: string
+        correlationId:
+          type: string
+          format: uuid
+          description: >
+            Correlation ID for this request. Matches the `X-Correlation-Id` response header.
+            Include this value in bug reports to allow cross-referencing with server logs.
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+          description: Validation errors only. Omitted for non-validation errors.
+
+    PaginationMeta:
+      type: object
+      properties:
+        totalElements:
+          type: integer
+        totalPages:
+          type: integer
+        currentPage:
+          type: integer
+        pageSize:
+          type: integer
+
+    RegisterRequest:
+      type: object
+      required: [username, email, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 50
+          pattern: '^[a-zA-Z0-9_]+$'
+        email:
+          type: string
+          format: email
+          maxLength: 255
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+          description: |
+            Min 12 characters; no character-class composition requirements.
+            The service checks the candidate against the HaveIBeenPwned
+            k-anonymity API and rejects any password found in a known breach
+            dataset. Recommended length: 16+ characters or a passphrase.
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+
+    LoginResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/UserRole'
+        enabled:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    AdminUserDetailResponse:
+      type: object
+      description: Full user profile returned to ADMIN callers. Includes account lockout state not present in the self-service UserResponse.
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          $ref: '#/components/schemas/UserRole'
+        enabled:
+          type: boolean
+        failedLoginAttempts:
+          type: integer
+          minimum: 0
+          description: Current consecutive failed login count. Reset to 0 on successful login or admin unlock.
+        lockedUntil:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp until which the account is locked. Null when not locked.
+        createdAt:
+          type: string
+          format: date-time
+
+    UserSummaryResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+        enabled:
+          type: boolean
+        lockedUntil:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO-8601 timestamp until which the account is locked. Null when account is not locked.
+        failedLoginAttempts:
+          type: integer
+          minimum: 0
+          description: Current count of consecutive failed login attempts. Reset to 0 on successful login or admin unlock.
+
+    ScanRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          maxLength: 2048
+          description: Valid HTTP(S) URL. Private IP ranges are blocked.
+        depth:
+          allOf:
+            - $ref: '#/components/schemas/ScanDepth'
+          default: QUICK
+
+    ScanJobResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        urlId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Present once the scanned_url record exists for this URL
+        url:
+          type: string
+        depth:
+          $ref: '#/components/schemas/ScanDepth'
+        status:
+          $ref: '#/components/schemas/ScanJobStatus'
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    ScanJobDetailResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        urlId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Present once the scanned_url record exists for this URL
+        url:
+          type: string
+        depth:
+          $ref: '#/components/schemas/ScanDepth'
+        status:
+          $ref: '#/components/schemas/ScanJobStatus'
+        supersededBy:
+          type: string
+          format: uuid
+          nullable: true
+          description: If this job was superseded, the ID of the new job
+        errorMessage:
+          type: string
+          nullable: true
+        result:
+          nullable: true
+          description: Null until the scan job reaches COMPLETED.
+          allOf:
+            - $ref: '#/components/schemas/ScanResultData'
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    ScanResultData:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        overallScore:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          nullable: true
+          description: |
+            Mean of max tier scores. NULL when all tiers produced empty findings.
+        tier1Findings:
+          $ref: '#/components/schemas/Tier1Findings'
+        tier2Findings:
+          description: Empty object {} for QUICK scans
+          allOf:
+            - $ref: '#/components/schemas/Tier2Findings'
+        tier3Findings:
+          description: Empty object {} for QUICK scans
+          allOf:
+            - $ref: '#/components/schemas/Tier3Findings'
+
+    UrlScanResponse:
+      type: object
+      properties:
+        urlId:
+          type: string
+          format: uuid
+        url:
+          type: string
+        communityVerdict:
+          $ref: '#/components/schemas/CommunityVerdict'
+        lastScannedAt:
+          type: string
+          format: date-time
+          nullable: true
+        latestResult:
+          nullable: true
+          description: Null when the URL has no scan_result rows (e.g. created by an incident report but never scanned).
+          allOf:
+            - $ref: '#/components/schemas/ScanResultData'
+
+    IncidentReportRequest:
+      type: object
+      required: [url, evidenceDescription]
+      properties:
+        url:
+          type: string
+          maxLength: 2048
+        evidenceDescription:
+          type: string
+          minLength: 10
+          maxLength: 2000
+        evidenceUrls:
+          type: array
+          items:
+            type: string
+            maxLength: 2048
+          maxItems: 5
+
+    IncidentReportResponse:
+      type: object
+      properties:
+        reportId:
+          type: string
+          format: uuid
+        urlId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        createdAt:
+          type: string
+          format: date-time
+
+    IncidentReportDetailResponse:
+      type: object
+      properties:
+        reportId:
+          type: string
+          format: uuid
+        url:
+          type: string
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        finalVerdict:
+          nullable: true
+          description: Null while the report is PENDING / PENDING_REVIEW.
+          allOf:
+            - $ref: '#/components/schemas/FinalVerdict'
+        evidenceDescription:
+          type: string
+        evidenceUrls:
+          type: array
+          items:
+            type: string
+        secbretAnalysis:
+          $ref: '#/components/schemas/SecBretAnalysisData'
+        securityTeamReview:
+          nullable: true
+          description: Null unless a human analyst review exists.
+          allOf:
+            - $ref: '#/components/schemas/SecurityTeamReviewData'
+        createdAt:
+          type: string
+          format: date-time
+        errorMessage:
+          type: string
+          nullable: true
+          description: Human-readable error description when status is FAILED (async analysis DB write error).
+        resolvedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    SecBretAnalysisData:
+      type: object
+      properties:
+        threatScore:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        verdict:
+          $ref: '#/components/schemas/AnalysisVerdict'
+        reasoningChain:
+          type: string
+        mlConsulted:
+          type: boolean
+        mlScore:
+          type: number
+          format: double
+          nullable: true
+        modelVersion:
+          type: string
+          nullable: true
+          description: >-
+            ML sidecar model version at classification time (e.g. "xgboost-v2.1"),
+            sourced from ClassificationResponse.model_version. Null on the
+            rules-only path (mlConsulted=false), where no sidecar was called and
+            no model version exists — the kit-ruleset version is tracked
+            separately as tier3Findings.kitRulesetVersion.
+
+    SecurityTeamReviewData:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        reviewedBy:
+          type: string
+          nullable: true
+          description: |
+            Username of the reviewing analyst. Null (rendered as "[deleted]") when the
+            analyst account has been GDPR-hard-deleted.
+        status:
+          type: string
+          enum: [APPROVED, REJECTED, MODIFIED]
+        finalVerdict:
+          $ref: '#/components/schemas/FinalVerdict'
+        reviewerNotes:
+          type: string
+          nullable: true
+        reviewedAt:
+          type: string
+          format: date-time
+
+    ReportListResponse:
+      type: object
+      allOf:
+        - type: object
+          properties:
+            reports:
+              type: array
+              items:
+                type: object
+                properties:
+                  reportId:
+                    type: string
+                    format: uuid
+                  url:
+                    type: string
+                  status:
+                    $ref: '#/components/schemas/ReportStatus'
+                  finalVerdict:
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/FinalVerdict'
+                  createdAt:
+                    type: string
+                    format: date-time
+        - $ref: '#/components/schemas/PaginationMeta'
+
+    ReportJobResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        urlId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportJobStatus'
+        createdAt:
+          type: string
+          format: date-time
+
+    ReportJobStatusResponse:
+      type: object
+      properties:
+        jobId:
+          type: string
+          format: uuid
+        urlId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ReportJobStatus'
+        shareLink:
+          nullable: true
+          description: Null until the report job reaches COMPLETED (auto-created link).
+          allOf:
+            - $ref: '#/components/schemas/ShareLinkData'
+        fileSizeBytes:
+          type: integer
+          nullable: true
+        errorMessage:
+          type: string
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    ShareLinkData:
+      type: object
+      properties:
+        uuid:
+          type: string
+        downloadUrl:
+          type: string
+        htmlViewUrl:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+
+    SharedReportResponse:
+      type: object
+      properties:
+        shareUuid:
+          type: string
+        url:
+          type: string
+        generatedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        executiveSummary:
+          type: object
+          properties:
+            threatScore:
+              type: number
+            verdict:
+              type: string
+            secbretReasoning:
+              type: string
+            securityTeamNotes:
+              type: string
+              nullable: true
+        technicalFindings:
+          type: object
+          properties:
+            tier1:
+              $ref: '#/components/schemas/Tier1Findings'
+            tier2:
+              $ref: '#/components/schemas/Tier2Findings'
+            tier3:
+              $ref: '#/components/schemas/Tier3Findings'
+
+    ShareLinkListResponse:
+      type: object
+      allOf:
+        - type: object
+          properties:
+            shareLinks:
+              type: array
+              items:
+                type: object
+                properties:
+                  uuid:
+                    type: string
+                  url:
+                    type: string
+                  reportJobId:
+                    type: string
+                    format: uuid
+                  createdAt:
+                    type: string
+                    format: date-time
+                  expiresAt:
+                    type: string
+                    format: date-time
+                  isRevoked:
+                    type: boolean
+                  accessCount:
+                    type: integer
+        - $ref: '#/components/schemas/PaginationMeta'
+
+    PublicDashboardResponse:
+      type: object
+      allOf:
+        - type: object
+          properties:
+            urls:
+              type: array
+              items:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  communityVerdict:
+                    $ref: '#/components/schemas/CommunityVerdict'
+                  threatScore:
+                    type: number
+                  lastScannedAt:
+                    type: string
+                    format: date-time
+        - $ref: '#/components/schemas/PaginationMeta'
+
+    PublicUrlDetailResponse:
+      type: object
+      properties:
+        url:
+          type: string
+        communityVerdict:
+          $ref: '#/components/schemas/CommunityVerdict'
+        threatScore:
+          type: number
+        secbretReasoning:
+          type: string
+        lastScannedAt:
+          type: string
+          format: date-time
+
+    PendingReviewsResponse:
+      type: object
+      allOf:
+        - type: object
+          properties:
+            pendingReviews:
+              type: array
+              items:
+                type: object
+                properties:
+                  reportId:
+                    type: string
+                    format: uuid
+                  url:
+                    type: string
+                  threatScore:
+                    type: number
+                  verdict:
+                    $ref: '#/components/schemas/AnalysisVerdict'
+                  reportedBy:
+                    type: string
+                    nullable: true
+                    description: |
+                      Username of the reporting user. Rendered as "[deleted]"
+                      when the reporter account has been GDPR-hard-deleted.
+                  reportedAt:
+                    type: string
+                    format: date-time
+        - $ref: '#/components/schemas/PaginationMeta'
+
+    ReviewDetailResponse:
+      type: object
+      properties:
+        reportId:
+          type: string
+          format: uuid
+        url:
+          type: string
+        reportedBy:
+          type: object
+          nullable: true
+          description: |
+            Present when the reporter account exists. Omitted (null) when the
+            reporter has been GDPR-hard-deleted.
+          properties:
+            id:
+              type: string
+              format: uuid
+            username:
+              type: string
+        evidence:
+          type: object
+          properties:
+            description:
+              type: string
+            urls:
+              type: array
+              items:
+                type: string
+        secbretAnalysis:
+          $ref: '#/components/schemas/SecBretAnalysisData'
+        scanResult:
+          nullable: true
+          description: Null when the report was filed for a URL that was never scanned (incident-report-without-prior-scan path; see Part III §3).
+          allOf:
+            - $ref: '#/components/schemas/ScanResultData'
+
+    ReviewSubmitRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          $ref: '#/components/schemas/ReviewAction'
+        finalVerdict:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/FinalVerdict'
+          description: |
+            Required when `action` is `MODIFY`; must be one of `VERIFIED_MALICIOUS` or `VERIFIED_BENIGN`.
+            **`REJECTED` is not a valid `finalVerdict` for `action: MODIFY`** — use `action: REJECT` instead,
+            which does not require `finalVerdict`.
+            When `action` is `APPROVE`, this field is ignored: the final verdict is derived from
+            `secbret_analysis.threat_score` using the `AUTO_APPROVE_ANALYST_THRESHOLD` (default 0.50) —
+            score ≥ 0.50 → `VERIFIED_MALICIOUS`, score < 0.50 → `VERIFIED_BENIGN`.
+        reviewerNotes:
+          type: string
+          maxLength: 5000
+
+    ReviewSubmitResponse:
+      type: object
+      properties:
+        reviewId:
+          type: string
+          format: uuid
+        reportId:
+          type: string
+          format: uuid
+        reviewedBy:
+          type: string
+        status:
+          type: string
+          enum: [APPROVED, REJECTED, MODIFIED]
+        finalVerdict:
+          $ref: '#/components/schemas/FinalVerdict'
+        reviewedAt:
+          type: string
+          format: date-time
+
+    UserListResponse:
+      type: object
+      allOf:
+        - type: object
+          properties:
+            users:
+              type: array
+              items:
+                $ref: '#/components/schemas/UserResponse'
+        - $ref: '#/components/schemas/PaginationMeta'
+
+    ChangeRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/UserRole'
+
+    ChangeStatusRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+
+    ShareLinkCreateRequest:
+      type: object
+      required: [reportJobId]
+      properties:
+        reportJobId:
+          type: string
+          format: uuid
+          description: UUID of a COMPLETED report job
+        expiryDays:
+          type: integer
+          minimum: 1
+          maximum: 365
+          default: 30
+          description: Number of days until the share link expires
+
+    ForgotPasswordRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+
+    ResetPasswordRequest:
+      type: object
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          description: UUID token from the password reset email
+        newPassword:
+          type: string
+          minLength: 12
+          maxLength: 128
+          description: |
+            Same policy as registration: min 12 characters, no composition
+            requirements, HIBP check applied on reset.
+
+    Tier1Findings:
+      type: object
+      properties:
+        domainAge:
+          type: string
+          example: "3_days"
+        sslValid:
+          type: boolean
+        sslExpiryDate:
+          type: string
+          format: date-time
+          nullable: true
+        sslIssuer:
+          type: string
+          nullable: true
+        httpHeaders:
+          type: object
+          properties:
+            xFrameOptions:
+              type: string
+            contentSecurityPolicy:
+              type: string
+            strictTransportSecurity:
+              type: string
+            xContentTypeOptions:
+              type: string
+        dnsRecords:
+          type: array
+          items:
+            type: string
+        redirectChain:
+          type: array
+          items:
+            type: string
+            format: uri
+        whoisInfo:
+          type: object
+          properties:
+            registrar:
+              type: string
+            creationDate:
+              type: string
+              format: date
+            nameservers:
+              type: array
+              items:
+                type: string
+
+    Tier2Findings:
+      type: object
+      properties:
+        hasLoginForm:
+          type: boolean
+        hasBrandLogo:
+          type: boolean
+        externalDomains:
+          type: array
+          items:
+            type: string
+            format: uri
+        suspiciousScripts:
+          type: integer
+          minimum: 0
+        hiddenIframes:
+          type: integer
+          minimum: 0
+        contentSizeBytes:
+          type: integer
+          minimum: 0
+        forms:
+          type: array
+          items:
+            type: object
+            properties:
+              action:
+                type: string
+                format: uri
+              method:
+                type: string
+                enum: [GET, POST, PUT, DELETE, PATCH]
+              inputFields:
+                type: array
+                items:
+                  type: string
+        links:
+          type: object
+          properties:
+            internal:
+              type: integer
+              minimum: 0
+            external:
+              type: integer
+              minimum: 0
+
+    Tier3Findings:
+      type: object
+      properties:
+        knownPhishingKit:
+          type: boolean
+        phishingKitName:
+          type: string
+          nullable: true
+        outdatedLibraries:
+          type: array
+          items:
+            type: string
+        cveMatches:
+          type: array
+          items:
+            type: string
+            pattern: '^CVE-\d{4}-\d+$'
+        openRedirect:
+          type: boolean
+        directoryListing:
+          type: boolean

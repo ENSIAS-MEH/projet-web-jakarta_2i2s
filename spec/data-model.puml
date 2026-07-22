@@ -1,0 +1,407 @@
+@startuml SecBret_ERD
+!define table(x) class x << (T,#FFAAAA) >>
+!define pk(x) <b><u>x</u></b>
+!define fk(x) <i>x</i>
+
+title SecBret - Entity Relationship Diagram
+
+entity "secbret_user" as User {
+    pk(id): UUID
+    --
+    username: VARCHAR(50) UNIQUE
+    email: VARCHAR(255) UNIQUE
+    password_hash: VARCHAR(255)
+    role: VARCHAR(20)  [REPORTER, ANALYST, ADMIN]
+    enabled: BOOLEAN
+    failed_login_attempts: INTEGER DEFAULT 0
+    locked_until: TIMESTAMP
+    created_at: TIMESTAMP
+    updated_at: TIMESTAMP
+}
+
+entity "scanned_url" as ScannedUrl {
+    pk(id): UUID
+    --
+    original_url: VARCHAR(2048)
+    normalized_hash: VARCHAR(64) -- UNIQUE (partial: WHERE deleted_at IS NULL)
+    last_scanned_at: TIMESTAMP
+    community_verdict: VARCHAR(30)  [UNKNOWN, BENIGN, SUSPICIOUS, MALICIOUS]
+    created_at: TIMESTAMP
+    updated_at: TIMESTAMP
+    deleted_at: TIMESTAMP  -- Soft-delete tombstone; all queries MUST filter IS NULL
+}
+
+entity "scan_job" as ScanJob {
+    pk(id): UUID
+    --
+    fk(url_id): UUID <<FK>>
+    fk(submitted_by): UUID <<FK, NULL>>  -- NULL after GDPR deletion
+    fk(superseded_by): UUID <<FK, NULL>>  -- points to the newer scan job that superseded this one
+    scan_depth: VARCHAR(10)  [QUICK, DEEP]
+    status: VARCHAR(20)  [PENDING, RUNNING, COMPLETED, SUPERSEDED, FAILED]
+    error_message: TEXT
+    version: BIGINT  -- Optimistic locking (@Version)
+    created_at: TIMESTAMP
+    started_at: TIMESTAMP
+    completed_at: TIMESTAMP
+}
+
+entity "scan_result" as ScanResult {
+    pk(id): UUID
+    --
+    fk(url_id): UUID <<FK>>
+    fk(scan_job_id): UUID <<FK, UQ>>
+    tier1_findings: JSONB
+    tier2_findings: JSONB
+    tier3_findings: JSONB
+    overall_score: DECIMAL(3,2)
+    created_at: TIMESTAMP
+}
+
+entity "user_report" as UserReport {
+    pk(id): UUID
+    --
+    fk(url_id): UUID <<FK>>
+    fk(reported_by): UUID <<FK, NULL>>  -- NULL after GDPR deletion
+    evidence_description: TEXT
+    evidence_urls: JSONB
+    status: VARCHAR(20)  [PENDING, PENDING_REVIEW, VERIFIED, REJECTED, FAILED]
+    verdict: VARCHAR(30)
+    error_message: TEXT        -- Populated when async analysis fails (see Part III §16.5)
+    created_at: TIMESTAMP
+    resolved_at: TIMESTAMP
+    version: BIGINT  -- Optimistic locking (@Version)
+    deleted_at: TIMESTAMP  -- Soft-delete tombstone; all queries MUST filter IS NULL
+}
+
+entity "secbret_analysis" as SecBretAnalysis {
+    pk(id): UUID
+    --
+    fk(url_id): UUID <<FK>>
+    fk(scan_result_id): UUID <<FK, NULL>>  -- ON DELETE SET NULL
+    fk(user_report_id): UUID <<FK, NULL>>  -- ON DELETE SET NULL
+    threat_score: DECIMAL(3,2)
+    verdict: VARCHAR(30)
+    reasoning_chain: TEXT
+    ml_consulted: BOOLEAN
+    ml_score: DECIMAL(3,2)
+    model_version: VARCHAR(50)  -- ML sidecar model version at classification time
+    created_at: TIMESTAMP
+}
+
+entity "security_team_review" as SecurityTeamReview {
+    pk(id): UUID
+    --
+    fk(user_report_id): UUID <<FK, UQ>>  -- 0..1 cardinality
+    fk(secbret_analysis_id): UUID <<FK>>
+    fk(reviewed_by): UUID <<FK, NULL>>  -- NULL after GDPR deletion
+    status: VARCHAR(20)  [APPROVED, REJECTED, MODIFIED]
+    reviewer_notes: TEXT
+    final_verdict: VARCHAR(30)  [VERIFIED_MALICIOUS, VERIFIED_BENIGN, REJECTED]
+    created_at: TIMESTAMP
+    reviewed_at: TIMESTAMP
+}
+
+entity "report_job" as ReportJob {
+    pk(id): UUID
+    --
+    fk(url_id): UUID <<FK>>
+    fk(requested_by): UUID <<FK, NULL>>  -- NULL after GDPR deletion
+    status: VARCHAR(20)  [PENDING, GENERATING, COMPLETED, FAILED]
+    file_data: BYTEA  -- PDF bytes, JPA @Lob(fetch = LAZY)
+    file_size_bytes: BIGINT
+    error_message: text  -- populated when status becomes FAILED
+    created_at: TIMESTAMP
+    completed_at: TIMESTAMP
+}
+
+entity "share_link" as ShareLink {
+    pk(id): UUID
+    --
+    fk(report_job_id): UUID <<FK>>
+    fk(created_by): UUID <<FK, NULL>>  -- NULL after GDPR deletion
+    uuid_token: VARCHAR(36) UNIQUE
+    expires_at: TIMESTAMP
+    is_revoked: BOOLEAN
+    access_count: INTEGER  -- NOT NULL DEFAULT 0 (atomic SQL increment)
+    created_at: TIMESTAMP
+    last_accessed_at: TIMESTAMP
+}
+
+entity "audit_log" as AuditLog {
+    pk(id): UUID
+    --
+    fk(actor_id): UUID <<FK, NULL>>  -- SET NULL on user deletion
+    actor_username: VARCHAR(50)  -- Snapshot; set to deleted_{uuid} on user deletion
+    action: VARCHAR(100)
+    target_type: VARCHAR(50)
+    target_id: UUID
+    detail: JSONB
+    internal_error_details: TEXT  -- Implementation details; not exposed via public API
+    created_at: TIMESTAMP
+}
+
+entity "password_reset_token" as PasswordResetToken {
+    pk(id): UUID
+    --
+    fk(user_id): UUID <<FK>>
+    token_hash: VARCHAR(64) UNIQUE  -- SHA-256 hex digest
+    expires_at: TIMESTAMP
+    used_at: TIMESTAMP
+    created_at: TIMESTAMP
+}
+
+entity "idempotency_key" as IdempotencyKey {
+    pk(id): UUID
+    --
+    fk(user_id): UUID <<FK>>
+    idem_key: VARCHAR(255)
+    endpoint: VARCHAR(100)
+    request_hash: VARCHAR(64)  -- SHA-256 of canonicalized body
+    response_status: INTEGER
+    response_body: TEXT
+    expires_at: TIMESTAMP
+    created_at: TIMESTAMP
+    UNIQUE (user_id, endpoint, idem_key)
+}
+
+entity "api_token" as ApiToken {
+    pk(id): UUID
+    --
+    fk(user_id): UUID <<FK>>
+    token_hash: VARCHAR(64) UNIQUE
+    label: VARCHAR(100)
+    created_at: TIMESTAMP
+    last_used_at: TIMESTAMP
+    expires_at: TIMESTAMP
+}
+
+entity "webhook_subscription" as WebhookSubscription {
+    pk(id): UUID
+    --
+    fk(owner_id): UUID <<FK>>
+    callback_url: VARCHAR(2048)
+    signing_secret_enc: VARCHAR(512)  -- AES-GCM ciphertext
+    event_types: VARCHAR(50)[]  -- e.g. array["scan.completed","report.completed"]
+    is_active: BOOLEAN DEFAULT TRUE
+    created_at: TIMESTAMP
+    last_delivery_at: TIMESTAMP
+    last_delivery_status: INTEGER
+}
+
+' --- Relationships ---
+User ||--o{ ScanJob : "submits"
+User ||--o{ UserReport : "reports"
+User ||--o{ ReportJob : "requests"
+User ||--o{ ShareLink : "creates"
+User ||--o{ SecurityTeamReview : "reviews"
+User ||--o{ AuditLog : "actors"
+User ||--o{ PasswordResetToken : "resets"
+User ||--o{ IdempotencyKey : "owns"
+User ||--o{ WebhookSubscription : "owns"
+User ||--o{ ApiToken : "owns"
+
+ScannedUrl ||--o{ ScanJob : "has"
+ScannedUrl ||--o{ ScanResult : "has"
+ScannedUrl ||--o{ UserReport : "reported"
+ScannedUrl ||--o| SecBretAnalysis : "analyzed"
+ScannedUrl ||--o{ ReportJob : "reported_on"
+
+ScanJob ||--|| ScanResult : "produces (1:1)"
+
+ScanResult ||--o{ SecBretAnalysis : "feeds"
+UserReport ||--o{ SecBretAnalysis : "triggers"
+
+UserReport ||--o| SecurityTeamReview : "reviewed_by (0..1)"
+SecBretAnalysis ||--o| SecurityTeamReview : "review_of (0..1)"
+
+ReportJob ||--o| ShareLink : "shared_via"
+
+@enduml
+
+
+
+@startuml SecBret_DB_Schema
+title SecBret - Physical Database Schema
+
+hide circle
+skinparam linetype ortho
+
+!define table(x) class x << (T,#DEEBF7) >>
+!define varchar(x) <color:green>VARCHAR</color>(x)
+!define uuid <color:green>UUID</color>
+!define timestamp <color:green>TIMESTAMP</color>
+!define decimal(x,y) <color:green>DECIMAL</color>(x,y)
+!define text <color:green>TEXT</color>
+!define jsonb <color:green>JSONB</color>
+
+table(secbret_user) {
+    id : uuid <<PK>>
+    username : varchar(50) <<UQ>>
+    email : varchar(255) <<UQ>>
+    password_hash : varchar(255)
+    role : varchar(20)
+    enabled : BOOLEAN
+    failed_login_attempts : INTEGER DEFAULT 0
+    locked_until : timestamp
+    created_at : timestamp
+    updated_at : timestamp
+}
+
+table(scanned_url) {
+    id : uuid <<PK>>
+    original_url : varchar(2048)
+    normalized_hash : varchar(64) <<UQ>> -- UNIQUE (partial: WHERE deleted_at IS NULL)
+    last_scanned_at : timestamp
+    community_verdict : varchar(30) -- UNKNOWN | BENIGN | SUSPICIOUS | MALICIOUS
+    created_at : timestamp
+    updated_at : timestamp
+    deleted_at : timestamp -- Soft-delete
+}
+
+table(scan_job) {
+    id : uuid <<PK>>
+    url_id : uuid <<FK>>
+    submitted_by : uuid <<FK, NULL>>
+    superseded_by : uuid <<FK, NULL>> -- self-reference for superseded jobs
+    scan_depth : varchar(10)
+    status : varchar(20) -- PENDING | RUNNING | COMPLETED | SUPERSEDED | FAILED
+    error_message : text
+    version : <color:green>BIGINT</color> -- Optimistic locking
+    created_at : timestamp
+    started_at : timestamp
+    completed_at : timestamp
+}
+
+table(scan_result) {
+    id : uuid <<PK>>
+    url_id : uuid <<FK>>
+    scan_job_id : uuid <<FK>>
+    tier1_findings : jsonb
+    tier2_findings : jsonb
+    tier3_findings : jsonb
+    overall_score : decimal(3,2)
+    created_at : timestamp
+}
+
+table(user_report) {
+    id : uuid <<PK>>
+    url_id : uuid <<FK>>
+    reported_by : uuid <<FK, NULL>>
+    evidence_description : text
+    evidence_urls : jsonb
+    status : varchar(20)
+    verdict : varchar(30)
+    created_at : timestamp
+    resolved_at : timestamp
+    error_message : text -- Populated when async analysis fails
+    version : BIGINT -- Optimistic locking
+    deleted_at : timestamp -- Soft-delete
+}
+
+table(secbret_analysis) {
+    id : uuid <<PK>>
+    url_id : uuid <<FK>>
+    scan_result_id : uuid <<FK, NULL>>  -- SET NULL on cascade
+    user_report_id : uuid <<FK, NULL>>  -- SET NULL on cascade
+    threat_score : decimal(3,2)
+    verdict : varchar(30)
+    reasoning_chain : text
+    ml_consulted : BOOLEAN
+    ml_score : decimal(3,2)
+    model_version : varchar(50) -- ML sidecar model version at classification time
+    created_at : timestamp
+}
+
+table(security_team_review) {
+    id : uuid <<PK>>
+    user_report_id : uuid <<FK, UQ>> -- 0..1
+    secbret_analysis_id : uuid <<FK>>
+    reviewed_by : uuid <<FK, NULL>>
+    status : varchar(20)
+    reviewer_notes : text
+    final_verdict : varchar(30) -- VERIFIED_MALICIOUS | VERIFIED_BENIGN | REJECTED
+    created_at : timestamp
+    reviewed_at : timestamp
+}
+
+table(report_job) {
+    id : uuid <<PK>>
+    url_id : uuid <<FK>>
+    requested_by : uuid <<FK, NULL>>
+    status : varchar(20)
+    file_data : bytea -- PDF bytes, JPA @Lob(fetch = LAZY)
+    file_size_bytes : BIGINT
+    error_message : text -- populated when status becomes FAILED
+    created_at : timestamp
+    completed_at : timestamp
+}
+
+table(share_link) {
+    id : uuid <<PK>>
+    report_job_id : uuid <<FK>>
+    created_by : uuid <<FK, NULL>>
+    uuid_token : varchar(36) <<UQ>>
+    expires_at : timestamp
+    is_revoked : BOOLEAN
+    access_count : INTEGER <<NOT NULL, DEFAULT 0>>
+    created_at : timestamp
+    last_accessed_at : timestamp
+}
+
+table(audit_log) {
+    id : uuid <<PK>>
+    actor_id : uuid <<FK, NULL>> -- SET NULL on user deletion
+    actor_username : varchar(50) -- Snapshot; set to deleted_{uuid} on user deletion
+    action : varchar(100)
+    target_type : varchar(50)
+    target_id : uuid
+    detail : jsonb
+    internal_error_details : text -- Implementation details; not exposed via public API
+    created_at : timestamp
+}
+
+table(password_reset_token) {
+    id : uuid <<PK>>
+    user_id : uuid <<FK>>
+    token_hash : varchar(64) <<UQ>> -- SHA-256 hex digest
+    expires_at : timestamp
+    used_at : timestamp
+    created_at : timestamp
+}
+
+table(idempotency_key) {
+    id : uuid <<PK>>
+    user_id : uuid <<FK>>
+    idem_key : varchar(255)
+    endpoint : varchar(100)
+    request_hash : varchar(64) -- SHA-256 of canonicalized body
+    response_status : INTEGER
+    response_body : text
+    expires_at : timestamp
+    created_at : timestamp
+}
+
+table(webhook_subscription) {
+    id : uuid <<PK>>
+    owner_id : uuid <<FK>>
+    callback_url : varchar(2048)
+    signing_secret_enc : varchar(512) -- AES-GCM ciphertext
+    event_types : varchar(50)[] -- e.g. array["scan.completed","report.completed"]
+    is_active : BOOLEAN
+    created_at : timestamp
+    last_delivery_at : timestamp
+    last_delivery_status : INTEGER
+}
+
+table(api_token) {
+    id : uuid <<PK>>
+    user_id : uuid <<FK>>
+    token_hash : varchar(64) <<UQ>> -- SHA-256 hex
+    label : varchar(100)
+    created_at : timestamp
+    last_used_at : timestamp
+    expires_at : timestamp
+}
+
+@enduml
