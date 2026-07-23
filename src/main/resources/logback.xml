@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+        Structured JSON logging for SecBret (SLF4J + Logback per spec §2).
+
+        Format: one JSON object per line, written to stdout.
+        Payara / Docker capture stdout; Docker's log driver handles rotation.
+
+        Fields per log line:
+          timestamp   — ISO-8601 with millis
+          level       — TRACE / DEBUG / INFO / WARN / ERROR
+          logger      — fully-qualified logger name
+          thread      — thread name
+          message     — log message
+          exception   — stack trace (only when an exception is attached)
+
+        Correlation ID (X-Request-ID) will be injected into MDC by the
+        CorrelationIdFilter in Phase 5 (Task 22) and surfaced as "requestId"
+        once that filter exists. The pattern below includes a conditional MDC
+        placeholder that is harmless when the key is absent.
+    -->
+
+    <appender name="STDOUT_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="ch.qos.logback.classic.encoder.PatternLayoutEncoder">
+            <!--
+                Logback's built-in JSON encoder (LogstashEncoder) is a separate
+                dependency; to keep Phase 1 lean we use a pattern that produces
+                valid JSON-ish structured output compatible with log-parsing tooling.
+                A true LogstashEncoder or janino-based encoder can be swapped in
+                during Phase 5 hardening without changing callers.
+            -->
+            <pattern>{"timestamp":"%d{yyyy-MM-dd'T'HH:mm:ss.SSSZ}","level":"%-5level","logger":"%logger{36}","thread":"%thread"%X{requestId:+,"requestId":"%X{requestId}"},"message":"%replace(%msg){'\"','\\\"'}"%ex{full,0}%nopex}%n</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- ================================================================
+         Logger levels
+         ================================================================ -->
+
+    <!-- SecBret application code: DEBUG in development, INFO in production.
+         In production set LOG_LEVEL env var and override via logback-spring.xml
+         or a Payara custom-log-levels config. -->
+    <logger name="com.secbret" level="${LOG_LEVEL:-INFO}" additivity="false">
+        <appender-ref ref="STDOUT_JSON"/>
+    </logger>
+
+    <!-- Flyway migration output -->
+    <logger name="org.flywaydb" level="INFO" additivity="false">
+        <appender-ref ref="STDOUT_JSON"/>
+    </logger>
+
+    <!-- Hibernate SQL: keep OFF unless debugging; enable per-session via MDC -->
+    <logger name="org.hibernate.SQL" level="OFF" additivity="false">
+        <appender-ref ref="STDOUT_JSON"/>
+    </logger>
+    <logger name="org.hibernate.type.descriptor.sql.BasicBinder" level="OFF" additivity="false">
+        <appender-ref ref="STDOUT_JSON"/>
+    </logger>
+
+    <!-- Payara / GlassFish internal: WARN only -->
+    <logger name="fish.payara" level="WARN" additivity="false">
+        <appender-ref ref="STDOUT_JSON"/>
+    </logger>
+
+    <!-- Root logger -->
+    <root level="WARN">
+        <appender-ref ref="STDOUT_JSON"/>
+    </root>
+</configuration>

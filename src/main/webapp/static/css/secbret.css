@@ -1,0 +1,143 @@
+/*
+ * SecBret — custom stylesheet (Phase 6 — Part V §2.3 §2.7 §2.9 §3.4 §3.5)
+ *
+ * Loaded after bootstrap.min.css. All assets self-hosted (ADR-0004 CSP strict 'self').
+ * No @import from external origins; no data: URIs.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Skip link (Part V §2.2) — visible only on keyboard focus
+ * --------------------------------------------------------------------------- */
+.skip-link {
+    position: absolute;
+    top: -9999px;
+    left: 0;
+    z-index: 9999;
+    padding: 0.5rem 1rem;
+    background-color: #000;
+    color: #fff;
+    font-weight: 600;
+    text-decoration: none;
+    border-radius: 0 0 0.25rem 0;
+}
+
+.skip-link:focus {
+    top: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Focus visibility — WCAG 2.4.11: focus indicator must not be obscured
+ * Bootstrap 5 provides :focus-visible outlines; ensure they are never hidden.
+ * --------------------------------------------------------------------------- */
+:focus-visible {
+    outline: 3px solid #0d6efd;
+    outline-offset: 2px;
+}
+
+/* Toast container must not obscure the focused element. The z-index of
+ * #toast-container (1090) is above Bootstrap modals (1050) but toasts are
+ * positioned in the corner — they do not overlap the main focus path. */
+
+/* ---------------------------------------------------------------------------
+ * Toast container — aria-live region targeted by secbret.js showToast()
+ * (Part V §1.3 / §2.5: assertive for errors, polite for success/info)
+ * --------------------------------------------------------------------------- */
+#toast-container {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    z-index: 1090; /* above Bootstrap modals (1050) */
+    min-width: 18rem;
+    max-width: 24rem;
+}
+
+/* Stack toasts vertically with a gap */
+#toast-live-polite > *,
+#toast-live-assertive > * {
+    margin-top: 0.5rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * Polling live regions (Part V §2.5)
+ * --------------------------------------------------------------------------- */
+[aria-live][aria-busy="true"] {
+    opacity: 0.6;
+}
+
+/* ---------------------------------------------------------------------------
+ * 429 Rate-limit countdown banner (Part V §1.1)
+ * --------------------------------------------------------------------------- */
+.rate-limit-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2000;
+    background-color: #dc3545;
+    color: #fff;
+    font-weight: 600;
+    text-align: center;
+    padding: 0.75rem 1rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * HTMX request indicator spinner (Part V §1.2)
+ * The .htmx-indicator class is toggled by HTMX; default display is none.
+ * --------------------------------------------------------------------------- */
+.htmx-indicator {
+    display: none;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+    display: inline-block;
+}
+
+/* ---------------------------------------------------------------------------
+ * Touch targets — WCAG 2.5.8 minimum 24×24 CSS px (Part V §3.5)
+ * Bootstrap buttons are already ≥ 44 px height; ensure small variants clear 24 px.
+ * --------------------------------------------------------------------------- */
+.btn-sm {
+    min-height: 2rem;     /* 32 px ≥ 24 px AA minimum */
+    min-width: 2rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * Motion — prefers-reduced-motion (Part V §2.9)
+ * Disable non-essential animations; polling continues (content, not motion).
+ * --------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    /* Keep spinner visible but static (stop the rotation) */
+    .spinner-border,
+    .spinner-grow {
+        animation: none !important;
+        border-color: currentColor !important;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Responsive table wrapper — applied via .table-responsive (Bootstrap)
+ * Ensure no horizontal overflow bleeds outside the container (Part V §3.4)
+ * --------------------------------------------------------------------------- */
+.table-responsive {
+    -webkit-overflow-scrolling: touch;
+}
+
+/* ---------------------------------------------------------------------------
+ * Error summary focus target (Part V §1.5 / §2.4)
+ * [data-a11y-focus] is picked up by secbret.js htmx:afterSettle handler.
+ * --------------------------------------------------------------------------- */
+[data-a11y-focus]:focus {
+    outline: 3px solid #dc3545;
+    outline-offset: 2px;
+    border-radius: 0.25rem;
+}

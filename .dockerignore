@@ -1,0 +1,13 @@
+# M-11: keep build context lean and keep secrets / dumps / VCS out of images.
+target/
+backups/
+.env
+.envlocal
+**/.venv/
+**/__pycache__/
+*.pyc
+e2e/node_modules/
+.git/
+.github/
+.idea/
+.vscode/
