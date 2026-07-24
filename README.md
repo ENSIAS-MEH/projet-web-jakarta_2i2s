@@ -266,23 +266,29 @@ browsers.
 
 ## 9. Getting Started (Containerized Deployment)
 
-**Prerequisites:** Docker 24+ and Docker Compose 2.x.
+**Prerequisites:** Docker 24+, Docker Compose 2.x, JDK 21, and Maven 3.8+.
 
 ```bash
 # 1. Configure environment
 cp .env.example .env
 #   edit .env: set DB_PASSWORD/POSTGRES_PASSWORD, SMTP_*, and the SEED_ADMIN_* values
 
-# 2. Build and start the full stack (Payara + PostgreSQL + ML sidecar + backup)
-docker compose up --build
+# 2. Build the WAR (the Dockerfile copies target/secbret.war; it is not built inside the image)
+mvn -DskipTests clean package
 
-# 3. Verify health
+# 3. Build and start the full stack (Payara + PostgreSQL + ML sidecar + backup)
+docker compose up -d --build
+
+# 4. Verify health (Payara needs ~60s to deploy the WAR on first boot)
 curl -sf http://localhost:8080/api/v1/health/ready
 
-# 4. Open the app
+# 5. Open the app
 #   http://localhost:8080/dashboard/public   (public)
 #   log in with the SEED_ADMIN_* credentials, then remove those vars from .env
 ```
+
+> To run with `.envlocal` instead of `.env` (relaxed local rate limits), pass it as the
+> interpolation file: `docker compose --env-file .envlocal up -d --build`.
 
 ---
 
