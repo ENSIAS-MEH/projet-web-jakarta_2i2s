@@ -1,0 +1,294 @@
+@startuml SecBret_C4_Context
+!include <C4/C4_Context>
+
+Person(user, "User", "Submits URLs for scanning and reports incidents")
+Person(analyst, "Security Analyst", "Reviews pending incident reports")
+System(secbret, "SecBret", "Web Scanner & Incident Reporting System")
+
+System_Ext(virustotal, "VirusTotal API", "External threat intel (future)")
+System(ml_sidecar, "SecBret ML Sidecar", "Python ML model for hybrid scoring")
+
+Rel(user, secbret, "Submits scans & reports, views dashboards", "HTTPS")
+Rel(analyst, secbret, "Reviews incidents, approves/rejects", "HTTPS")
+Rel(secbret, ml_sidecar, "Sends uncertain cases for ML scoring", "gRPC")
+Rel(secbret, virustotal, "Enriches scan data (future)", "REST")
+
+@enduml
+
+
+
+@startuml SecBret_C4_Container
+!include <C4/C4_Container>
+
+Person(user, "User")
+Person(analyst, "Security Analyst")
+
+System_Boundary(secbret, "SecBret System") {
+    Container(web_ui, "Web Dashboard", "JSP + HTMX + Bootstrap", "Server-rendered UI with Jakarta MVC (Krazo)")
+    Container(rest_api, "REST API", "Jakarta REST (JAX-RS)", "Public API for external integrations")
+    Container(app_layer, "Application Layer", "Jakarta CDI Beans", "Controllers, DTOs, Validation")
+    Container(service_layer, "Service Layer", "Jakarta CDI Services", "Business logic orchestration")
+    Container(scanner, "Scanner Engine", "Async @ManagedExecutorService", "Tier 1, 2, 3 scanners")
+    Container(ai_engine, "SecBret Rules Engine", "Java Rule Engine", "Heuristic scoring + routing to ML")
+    Container(report_engine, "Report Engine", "Async @ManagedExecutorService", "OpenPDF generation (3-page condensed)")
+    Container(security, "Security Layer", "Soteria + Servlet Filters", "RBAC, Rate Limiting, CSP/CORS/HSTS/CSRF")
+    Container(ml_sidecar, "Python ML Sidecar", "Python 3.11 / gRPC", "gRPC service for ML scoring in Docker Compose")
+    ContainerDb(db, "PostgreSQL", "Relational Database", "Scans, reports, users, reviews")
+}
+
+System_Ext(target_url, "Target URLs", "Scanned websites")
+
+Rel(user, web_ui, "Uses dashboard", "HTTPS")
+Rel(user, rest_api, "Integrates via API", "HTTPS")
+Rel(analyst, web_ui, "Reviews incidents", "HTTPS")
+Rel(web_ui, app_layer, "Jakarta MVC", "JSP/Render")
+Rel(rest_api, app_layer, "JAX-RS", "JSON")
+Rel(app_layer, security, "All requests gated by", "Soteria/Filter")
+Rel(app_layer, service_layer, "CDI Injection", "Java")
+Rel(service_layer, scanner, "Submits scan jobs", "ManagedExecutorService (post-commit)")
+Rel(service_layer, ai_engine, "Submits scoring job", "ManagedExecutorService (post-commit)")
+Rel(service_layer, report_engine, "Submits PDF report job", "ManagedExecutorService (post-commit)")
+Rel(ai_engine, ml_sidecar, "Uncertain cases", "gRPC")
+Rel(scanner, target_url, "HTTP fetch (Tier 2)", "HTTPS")
+Rel(scanner, db, "Persists results", "JDBC/JPA")
+Rel(service_layer, db, "Persists reports/reviews", "JDBC/JPA")
+Rel(report_engine, db, "Reads scan data, writes report meta", "JDBC/JPA")
+
+@enduml
+
+
+
+@startuml SecBret_MVC_Layers
+title SecBret - MVC Layered Architecture
+
+package "Presentation Layer" {
+    [Jakarta MVC\n(Krazo + JSP)] as mvc
+    [Jakarta REST\n(JAX-RS)] as rest
+}
+
+package "Web Controller Layer (Krazo MVC @Controller)" {
+    [ScanWebController] as scan_web
+    [AuthWebController] as auth_web
+    [AdminWebController] as admin_web
+    [DashboardController] as dash_web
+    [ReportController] as report_web
+}
+
+package "REST Resource Layer (JAX-RS @Path)" {
+    [ScanResource] as scan_ctrl
+    [ReportJobResource] as reportjob_ctrl
+    [ShareResource] as share_ctrl
+    [AdminResource] as admin_ctrl
+    [PublicDashboardResource] as dash_ctrl
+    [IncidentResource] as incident_ctrl
+    [AuthResource] as auth_ctrl
+}
+
+package "Service Layer" {
+    [ScanService] as scan_svc
+    [IncidentService] as incident_svc
+    [ThreatAnalyzer] as ai_svc
+    [SecurityTeamReviewService] as review_svc
+    [ReportGenerationService] as report_svc
+    [UserService] as user_svc
+    [ShareLinkService] as share_svc
+    [EmailService] as email_svc
+    [AuditLogService] as audit_svc
+    [PublicDashboardService] as dash_svc
+    [PasswordResetService] as pwreset_svc
+    [IdempotencyService] as idem_svc
+    [ScannedUrlService] as url_svc
+}
+
+package "Domain Layer" {
+    [Entities\n(ScannedUrl, ScanJob,\nScanResult, UserReport,\nSecBretAnalysis,\nSecurityTeamReview,\nReportJob, ShareLink)] as entities
+    [DTOs\n(ScanRequest, ReportRequest,\nScanResponse, ReportResponse)] as dtos
+    [Enums\n(ScanStatus, Verdict,\nScanDepth, ReportStatus,\nUserRole)] as enums
+}
+
+package "Infrastructure Layer" {
+    [JPA Repositories] as repos
+    [Flyway Migrations] as flyway
+    ' Servlet filter chain, wired in fixed order in web.xml
+    [CorrelationIdFilter] as correlationid
+    [RateLimitFilter] as ratelimit
+    [CorsFilter] as corsfilter
+    [SecurityHeadersFilter] as secheaders
+    [Soteria IdentityStore] as soteria
+}
+
+package "Scanner Engine (Async)" {
+    [Tier1Scanner\n(Passive: DNS/SSL/WHOIS)] as t1
+    [Tier2Scanner\n(Active: jsoup HTML)] as t2
+    [Tier3Scanner\n(Vuln: CVE/Pattern Match)] as t3
+}
+
+package "AI Engine" {
+    [RulesEngine\n(Java Heuristics)] as rules
+    [ML Sidecar Client\n(gRPC)] as mlclient
+}
+
+package "Report Engine (Async)" {
+    [OpenPDF Generator] as pdfgen
+    [JPA @Lob Store] as lobstore
+}
+
+package "Health & Observability" {
+    [HealthResource\nGET /api/v1/health/live] as health_live
+    [HealthResource\nGET /api/v1/health/ready] as health_ready
+    [HealthResource\nGET /api/v1/health/dependencies] as health_deps
+    [SLF4J + Logback\n(JSON structured)] as logging
+}
+
+mvc --> scan_web
+mvc --> admin_web
+mvc --> dash_web
+mvc --> report_web
+mvc --> auth_web
+scan_web --> scan_svc
+auth_web --> user_svc
+admin_web --> user_svc
+dash_web --> dash_svc
+report_web --> share_svc
+rest --> scan_ctrl
+rest --> reportjob_ctrl
+rest --> share_ctrl
+rest --> admin_ctrl
+rest --> auth_ctrl
+
+note "Request Pipeline (web.xml order):\nClient → CorrelationIdFilter\n→ RateLimitFilter\n→ CorsFilter\n→ SecurityHeadersFilter\n→ Soteria authN + @RolesAllowed\n→ Resource / Controller\n\nCSRF: Krazo session token (web MVC),\nX-CSRF-Token header (REST)" as PipelineNote
+
+health_ready --> repos : readiness check (DB)
+health_deps --> mlclient : dependency check (gRPC)
+health_deps --> email_svc : dependency check
+
+scan_ctrl --> scan_svc
+reportjob_ctrl --> report_svc
+share_ctrl --> share_svc
+admin_ctrl --> review_svc
+dash_ctrl --> dash_svc
+incident_ctrl --> incident_svc
+auth_ctrl --> user_svc
+auth_ctrl --> pwreset_svc
+pwreset_svc --> email_svc
+
+scan_svc --> t1
+scan_svc --> t2
+scan_svc --> t3
+incident_svc --> ai_svc
+ai_svc --> rules
+rules --> mlclient
+report_svc --> pdfgen
+pdfgen --> lobstore
+
+scan_svc --> url_svc
+incident_svc --> url_svc
+
+scan_svc --> repos
+incident_svc --> repos
+review_svc --> repos
+report_svc --> repos
+user_svc --> repos
+share_svc --> repos
+audit_svc --> repos
+dash_svc --> repos
+pwreset_svc --> repos
+idem_svc --> repos
+url_svc --> repos
+
+
+@enduml
+
+
+
+@startuml SecBret_Deployment
+title SecBret - Docker Compose Deployment
+
+node "Host Machine" {
+    
+    node "payara (port 8080)" {
+        component [Payara 6 Server\n1GB RAM / 1 CPU\nJVM: -Xmx768m -Xms256m\n-XX:+UseG1GC] as payara
+        component [SecBret WAR] as war
+        war -- payara
+        file "/api/v1/health/live" as health_live_d
+        file "/api/v1/health/ready" as health_ready_d
+    }
+
+    node "postgres (internal only)" {
+        database "PostgreSQL 14+\n512MB RAM / 0.5 CPU\nshared_buffers=128MB" as pg {
+            file "flyway" as fly
+            file "data" as data
+        }
+    }
+
+    node "secbret-ml (internal only)" {
+        component [Python gRPC Server\n256MB RAM / 0.5 CPU\nport 50051, not host-published] as ml
+        file "model.pkl" as model
+        ml -- model
+    }
+
+    package "volumes" {
+        file "pg_data" as pgvol
+    }
+}
+
+note as BackupNote
+  Optional db-backup sidecar (daily pg_dump loop)
+  is available commented-out in docker-compose.yml.
+end note
+
+payara --> pg : JDBC
+payara --> ml : gRPC
+pgvol --> pg
+health_live_d --> payara : liveness probe
+health_ready_d --> payara : readiness probe
+note right of health_ready_d
+  /api/v1/health/ready is the
+  compose healthcheck endpoint;
+  /health/live is orchestrator
+  liveness only.
+end note
+
+@enduml
+
+
+
+@startuml SecBret_Usecases
+left to right direction
+
+actor User
+actor "Security Analyst" as Analyst
+actor "Administrator" as Admin
+actor "Anonymous User" as Anon
+
+note "Admin inherits all Analyst\npermissions plus user management" as N1
+Admin .. N1
+
+rectangle "SecBret" {
+    usecase "Submit URL Scan" as UC1
+    usecase "View Scan Results" as UC2
+    usecase "Report Incident" as UC3
+    usecase "Generate Report PDF" as UC4
+    usecase "Share Report Link" as UC5
+    usecase "Register / Login" as UC6
+    usecase "View Public Dashboard" as UC7
+    usecase "Review Pending Incidents" as UC8
+    usecase "Approve / Reject Incident" as UC9
+    usecase "Manage Users" as UC10
+}
+
+User --> UC1
+User --> UC2
+User --> UC3
+User --> UC4
+User --> UC5
+User --> UC6
+Analyst --> UC8
+Analyst --> UC9
+Admin --> UC8
+Admin --> UC9
+Admin --> UC10
+Anon --> UC7
+Anon --> UC5
+
+@enduml

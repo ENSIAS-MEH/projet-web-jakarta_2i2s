@@ -1,0 +1,16 @@
+POSTGRES_DB=secbret
+POSTGRES_USER=secbret
+POSTGRES_PASSWORD=localdev-only-3f9a
+DB_URL=jdbc:postgresql://postgres:5432/secbret
+DB_USER=secbret
+DB_PASSWORD=localdev-only-3f9a
+SMTP_HOST=localhost
+SMTP_PORT=587
+SMTP_TLS=true
+SMTP_USERNAME=noop
+SMTP_PASSWORD=noop
+EMAIL_FROM=noreply@secbret.internal
+SEED_ADMIN_USERNAME=admin
+SEED_ADMIN_EMAIL=admin@secbret.internal
+SEED_ADMIN_PASSWORD=localdev-admin-password
+APP_BASE_URL=http://localhost:8080

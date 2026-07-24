@@ -1,0 +1,113 @@
+services:
+  postgres:
+    image: postgres:14-alpine
+    networks:
+      - backend
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+    restart: unless-stopped
+  payara:
+    build: .
+    networks:
+      - backend
+      - ml
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      secbret-ml:
+        condition: service_healthy
+    environment:
+      JAVA_TOOL_OPTIONS: >-
+        -Xmx768m
+        -Xms256m
+        -XX:+UseG1GC
+      ML_SIDECAR_HOST: secbret-ml:50051
+      AUTO_DECISION_SAMPLE_RATE: "0.05"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v1/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+    restart: unless-stopped
+  secbret-ml:
+    build: ./ml-sidecar
+    expose:
+      - "50051"
+    networks:
+      - ml
+    volumes:
+      - ./ml-sidecar/model:/app/model
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import grpc; ch=grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+    restart: unless-stopped
+  db-backup:
+    image: postgres:14-alpine
+    networks:
+      - backend
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        export PGPASSWORD="$$POSTGRES_PASSWORD"
+        while true; do
+          pg_dump -h postgres -U "$$POSTGRES_USER" "$$POSTGRES_DB" \
+            | gzip > "/backups/secbret_$$(date +%Y%m%d_%H%M%S).sql.gz"
+          find /backups -name '*.sql.gz' -mtime "+$${BACKUP_RETENTION_DAYS:-7}" -delete
+          sleep 86400
+        done
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.25"
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+networks:
+  backend:
+  ml:

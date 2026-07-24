@@ -1,0 +1,29 @@
+// secbret.proto — normative gRPC contract for the SecBret ML sidecar.
+//
+// File naming note: The spec §7 heading calls this file "protosec.proto" but
+// Part II §12 project-structure tree specifies the path as proto/secbret.proto.
+// §12 is the authoritative layout reference; this file honours that path.
+// The package name, message names, and field numbers are transcribed verbatim
+// from the §7 gRPC Contract table.
+
+syntax = "proto3";
+
+package secbret.ml;
+
+service MLScorer {
+    rpc Classify (ClassificationRequest) returns (ClassificationResponse);
+}
+
+message ClassificationRequest {
+    string url = 1;
+    double rule_score = 2;
+    string tier1_findings_json = 3;
+    string tier2_findings_json = 4;
+    string tier3_findings_json = 5;
+}
+
+message ClassificationResponse {
+    double ml_score = 1;
+    double confidence = 2;
+    string model_version = 3;
+}

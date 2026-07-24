@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence version="3.1"
+             xmlns="https://jakarta.ee/xml/ns/persistence"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence
+                 https://jakarta.ee/xml/ns/persistence/persistence_3_1.xsd">
+
+    <!--
+        JTA persistence unit for SecBret.
+
+        DataSource: java:app/jdbc/SecBretDS — defined in web.xml via <resource-ref>
+        and instantiated by the @DataSourceDefinition in DataSourceConfig.java.
+
+        Pool sizing per spec §6:
+          min 5, max 20, connection-timeout 30s, idle-timeout 300s, validation "SELECT 1"
+    -->
+    <persistence-unit name="SecBretPU" transaction-type="JTA">
+        <!-- Spec Part II §2 pins Hibernate 6; Payara's default is EclipseLink,
+             so the provider must be named and hibernate-core bundled in the WAR. -->
+        <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
+        <jta-data-source>java:app/jdbc/SecBretDS</jta-data-source>
+
+        <class>com.secbret.model.entity.SecBretUser</class>
+        <class>com.secbret.model.entity.ScannedUrl</class>
+        <class>com.secbret.model.entity.ScanJob</class>
+        <class>com.secbret.model.entity.ScanResult</class>
+        <class>com.secbret.model.entity.UserReport</class>
+        <class>com.secbret.model.entity.SecBretAnalysis</class>
+        <class>com.secbret.model.entity.SecurityTeamReview</class>
+        <class>com.secbret.model.entity.AuditLog</class>
+        <class>com.secbret.model.entity.ReportJob</class>
+        <class>com.secbret.model.entity.ShareLink</class>
+        <class>com.secbret.model.entity.PasswordResetToken</class>
+        <class>com.secbret.model.entity.IdempotencyKey</class>
+        <exclude-unlisted-classes>true</exclude-unlisted-classes>
+
+        <properties>
+            <!-- Hibernate dialect is auto-detected with Hibernate 6 + PostgreSQL driver -->
+            <property name="jakarta.persistence.schema-generation.database.action" value="none"/>
+
+            <!-- Hibernate settings -->
+            <property name="hibernate.show_sql" value="false"/>
+            <property name="hibernate.format_sql" value="false"/>
+            <property name="hibernate.use_sql_comments" value="false"/>
+
+            <!--
+                PostgreSQL dialect — set explicitly so Hibernate 6 does not need
+                a live JDBC connection during EMF construction to auto-detect the
+                dialect.  Auto-detection requires obtaining a connection before the
+                JTA transaction manager is fully wired, which fails on Payara with
+                a bundled (non-container-default) JPA provider.
+            -->
+            <property name="hibernate.dialect" value="org.hibernate.dialect.PostgreSQLDialect"/>
+
+            <!--
+                JTA platform — tells Hibernate 6 which JTA transaction manager
+                to use.  Payara is built on GlassFish; the correct platform
+                implementation is SunOneJtaPlatform (covers both GF and Payara).
+                Without this, Hibernate logs "No JTA platform available" and
+                cannot enlist data-source connections in container-managed
+                transactions.
+            -->
+            <property name="hibernate.transaction.jta.platform"
+                      value="org.hibernate.engine.transaction.jta.platform.internal.SunOneJtaPlatform"/>
+
+            <!--
+                Disable Hibernate's runtime bytecode enhancement (all three knobs).
+
+                ROOT CAUSE: Payara's JPADeployer.visitPUD registers Hibernate's
+                EnhancingClassTransformerImpl as a JVM ClassFileTransformer.
+                When Hibernate then processes entity metadata and tries to
+                initialise its ByteBuddy infrastructure, the JVM must load
+                CorePrefixFilter — but that class load itself re-enters the
+                WebappClassLoader, which tries to run the transformer again for
+                the in-flight CorePrefixFilter load → ClassCircularityError.
+
+                Setting all three enhancer flags to false prevents Hibernate 6
+                from calling addTransformer() on the JPA SPI's LoadAgent, so the
+                problematic ClassFileTransformer is never registered and the
+                circularity never occurs.
+
+                Functional impact: dirty-tracking (change detection) falls back
+                to the legacy snapshot-comparison mechanism, lazy-loading uses
+                proxy objects instead of field-level interception, and association
+                management is handled by the application. All existing behaviour
+                is preserved; there is no correctness regression, only a minor
+                runtime overhead for dirty-checking (acceptable for this workload).
+            -->
+            <property name="hibernate.enhancer.enableDirtyTracking"         value="false"/>
+            <property name="hibernate.enhancer.enableLazyInitialization"     value="false"/>
+            <property name="hibernate.enhancer.enableAssociationManagement"  value="false"/>
+
+            <!--
+                Connection pool properties expressed as Hibernate connection pool hints.
+                Authoritative pool sizing lives in DataSourceConfig.java
+                (@DataSourceDefinition) where Payara enforces them at the JDBC pool level.
+            -->
+            <property name="hibernate.connection.pool_size" value="20"/>
+        </properties>
+    </persistence-unit>
+</persistence>

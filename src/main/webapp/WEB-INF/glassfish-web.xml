@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE glassfish-web-app PUBLIC
+    "-//GlassFish.org//DTD GlassFish Application Server 3.1 Servlet 3.0//EN"
+    "http://glassfish.org/dtds/glassfish-web-app_3_0-1.dtd">
+<!-- Spec addresses all URLs at the server root (README §11: health at
+     http://localhost:8080/api/v1/health/ready, UI at /dashboard/public),
+     so the WAR must deploy at context root "/" rather than the default
+     "/secbret" derived from the WAR filename. -->
+<glassfish-web-app>
+    <context-root>/</context-root>
+
+    <!-- Map the Soteria IdentityStore group names to declared security roles
+         (Task 6). The SecBretIdentityStore returns the user's UserRole name as a
+         caller group (REPORTER / ANALYST / ADMIN); @RolesAllowed checks against
+         security roles, so each group is mapped 1:1 to the same-named role. This
+         makes group→role mapping explicit rather than relying on Payara's
+         default-principal-to-role mapping being enabled. -->
+    <security-role-mapping>
+        <role-name>REPORTER</role-name>
+        <group-name>REPORTER</group-name>
+    </security-role-mapping>
+    <security-role-mapping>
+        <role-name>ANALYST</role-name>
+        <group-name>ANALYST</group-name>
+    </security-role-mapping>
+    <security-role-mapping>
+        <role-name>ADMIN</role-name>
+        <group-name>ADMIN</group-name>
+    </security-role-mapping>
+
+    <!-- H-2 LOCAL HTTP DEV OVERRIDE. web.xml defaults the session cookie to
+         Secure=true (production posture: cookie only sent over HTTPS). This
+         local/demo stack serves plain HTTP on :8080, where a browser never
+         sends a Secure cookie and login would break. Override to Secure=false
+         HERE so the insecure exception lives in the GlassFish-specific
+         descriptor, not the portable web.xml.
+         PRODUCTION: terminate TLS and remove this block (or set the network
+         listener to enforce Secure). See docs/plans/SECURITY_REMEDIATION_PLAN.md H-2. -->
+    <session-config>
+        <cookie-properties>
+            <property name="cookieSecure" value="false"/>
+        </cookie-properties>
+    </session-config>
+</glassfish-web-app>

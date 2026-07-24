@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="https://jakarta.ee/xml/ns/jakartaee"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee
+             https://jakarta.ee/xml/ns/jakartaee/web-app_6_0.xsd"
+         version="6.0">
+
+    <display-name>SecBret — Phishing Analysis Platform</display-name>
+
+    <!-- ================================================================
+         Session management (spec §6 Additional Variables: SESSION_TIMEOUT_MIN = 30)
+         Note: per spec, this is NOT read from env in v1; it is fixed here.
+         Override via Payara admin console if needed.
+         ================================================================ -->
+    <session-config>
+        <session-timeout>30</session-timeout>
+        <cookie-config>
+            <!-- Phase 5 (Task 22): HttpOnly per Part II §5 / Part III §Conventions -->
+            <!-- SameSite=Strict is set by SameSiteCookieFilter (Payara 6 / Servlet 6.0
+                 does not support <same-site> in web.xml; that is Servlet 6.1/Jakarta EE 11) -->
+            <http-only>true</http-only>
+            <!-- H-2: default to Secure so the cookie is only ever sent over HTTPS
+                 (the only valid production posture). The local HTTP :8080 demo
+                 stack overrides this to false in glassfish-web.xml, keeping the
+                 insecure setting out of the portable descriptor. -->
+            <secure>true</secure>
+        </cookie-config>
+        <tracking-mode>COOKIE</tracking-mode>
+    </session-config>
+
+    <!-- ================================================================
+         DataSource resource reference — resolves to the @DataSourceDefinition
+         declared in DataSourceConfig.java bound at java:app/jdbc/SecBretDS
+         ================================================================ -->
+    <resource-ref>
+        <res-ref-name>jdbc/SecBretDS</res-ref-name>
+        <res-type>javax.sql.DataSource</res-type>
+        <res-auth>Container</res-auth>
+    </resource-ref>
+
+    <!-- ================================================================
+         Phase 5 (Task 22): Security filters.
+         Filter order matters: SecurityHeaderFilter runs first (sets CSP nonce as
+         request attribute before any rendering), then RateLimitFilter (may short-
+         circuit before auth), then the Jersey/Krazo MVC filter.
+         @WebFilter annotations on both classes declare urlPatterns="/*", but
+         web.xml filter-mapping order determines priority when multiple filters
+         share the same pattern. We also declare explicit filter + filter-mapping
+         entries here to guarantee ordering across servlet containers.
+         ================================================================ -->
+    <filter>
+        <filter-name>SecurityHeaderFilter</filter-name>
+        <filter-class>com.secbret.filter.SecurityHeaderFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>SecurityHeaderFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <filter>
+        <filter-name>RateLimitFilter</filter-name>
+        <filter-class>com.secbret.filter.RateLimitFilter</filter-class>
+    </filter>
+    <filter-mapping>
+        <filter-name>RateLimitFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <!-- ================================================================
+         Jakarta MVC (Krazo) web controllers — Task 6.
+         Registered as a Jersey *filter* (not a servlet) with
+         forwardOn404=true so that:
+           - controller routes at the ROOT (/login, /register, /logout,
+             /dashboard) are handled by Krazo/Jersey;
+           - JSP view forwards (/WEB-INF/views/**.jsp) and static assets
+             (/static/**) that Krazo does NOT match fall THROUGH to the
+             container's JSP/default servlet instead of being swallowed.
+         Registering Jersey as a servlet mapped to /* re-intercepts the
+         internal JSP forward and makes Krazo's response wrapper recurse
+         (StackOverflowError); the filter + forwardOn404 pattern is the
+         supported way to host root-level MVC controllers alongside static
+         content. The /api/v1 REST application (SecBretApplication) is a
+         separate @ApplicationPath servlet and is unaffected.
+         ================================================================ -->
+    <filter>
+        <filter-name>MvcJerseyFilter</filter-name>
+        <filter-class>org.glassfish.jersey.servlet.ServletContainer</filter-class>
+        <init-param>
+            <param-name>jakarta.ws.rs.Application</param-name>
+            <param-value>com.secbret.config.MvcApplication</param-value>
+        </init-param>
+        <init-param>
+            <param-name>jersey.config.servlet.filter.forwardOn404</param-name>
+            <param-value>true</param-value>
+        </init-param>
+    </filter>
+    <filter-mapping>
+        <filter-name>MvcJerseyFilter</filter-name>
+        <url-pattern>/*</url-pattern>
+    </filter-mapping>
+
+    <!-- ================================================================
+         Security roles (Part II §4 RBAC). Declared so the container
+         recognises the @RolesAllowed({"REPORTER","ANALYST","ADMIN"}) names on
+         Krazo controllers; glassfish-web.xml maps each to the same-named group
+         emitted by SecBretIdentityStore.
+         ================================================================ -->
+    <security-role>
+        <role-name>REPORTER</role-name>
+    </security-role>
+    <security-role>
+        <role-name>ANALYST</role-name>
+    </security-role>
+    <security-role>
+        <role-name>ADMIN</role-name>
+    </security-role>
+
+    <!-- ================================================================
+         Welcome file — placeholder; JSP layout added in Phase 2 (Task 7)
+         ================================================================ -->
+    <welcome-file-list>
+        <welcome-file>index.jsp</welcome-file>
+    </welcome-file-list>
+
+</web-app>
