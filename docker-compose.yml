@@ -1,5 +1,5 @@
 services:
- postgres:
+  postgres:
     image: postgres:14-alpine
     networks:
       - backend
@@ -21,7 +21,7 @@ services:
           memory: 512m
           cpus: "0.5"
     restart: unless-stopped
-payara:
+  payara:
     build: .
     networks:
       - backend
