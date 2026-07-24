@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+        Test-only logging configuration.
+        Writes plain-text to stdout (human-readable during test runs).
+        Does NOT use the production JSON pattern to keep test output readable.
+    -->
+
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- SecBret code: DEBUG during tests -->
+    <logger name="com.secbret" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT"/>
+    </logger>
+
+    <!-- Flyway: INFO to show migration output in CI logs -->
+    <logger name="org.flywaydb" level="INFO" additivity="false">
+        <appender-ref ref="STDOUT"/>
+    </logger>
+
+    <!-- Testcontainers: INFO for container lifecycle events -->
+    <logger name="org.testcontainers" level="INFO" additivity="false">
+        <appender-ref ref="STDOUT"/>
+    </logger>
+    <logger name="com.github.dockerjava" level="WARN" additivity="false">
+        <appender-ref ref="STDOUT"/>
+    </logger>
+
+    <!-- Hibernate SQL: OFF in tests unless a test explicitly enables it -->
+    <logger name="org.hibernate.SQL" level="OFF"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

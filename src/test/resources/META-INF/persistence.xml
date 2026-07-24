@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence version="3.1"
+             xmlns="https://jakarta.ee/xml/ns/persistence"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence
+                 https://jakarta.ee/xml/ns/persistence/persistence_3_1.xsd">
+
+    <!-- RESOURCE_LOCAL unit for Testcontainers integration tests. JDBC URL,
+         user, and password are supplied programmatically from the running
+         container (PostgresIntegrationSupport). Schema comes from Flyway
+         (the real V1-V20 migrations), never from Hibernate DDL generation. -->
+    <persistence-unit name="SecBretTestPU" transaction-type="RESOURCE_LOCAL">
+        <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
+
+        <class>com.secbret.model.entity.SecBretUser</class>
+        <class>com.secbret.model.entity.ScannedUrl</class>
+        <class>com.secbret.model.entity.ScanJob</class>
+        <class>com.secbret.model.entity.ScanResult</class>
+        <class>com.secbret.model.entity.UserReport</class>
+        <class>com.secbret.model.entity.SecBretAnalysis</class>
+        <class>com.secbret.model.entity.SecurityTeamReview</class>
+        <class>com.secbret.model.entity.AuditLog</class>
+        <class>com.secbret.model.entity.ReportJob</class>
+        <class>com.secbret.model.entity.ShareLink</class>
+        <class>com.secbret.model.entity.PasswordResetToken</class>
+        <class>com.secbret.model.entity.IdempotencyKey</class>
+        <exclude-unlisted-classes>true</exclude-unlisted-classes>
+
+        <properties>
+            <property name="jakarta.persistence.schema-generation.database.action" value="none"/>
+            <property name="hibernate.show_sql" value="false"/>
+        </properties>
+    </persistence-unit>
+</persistence>
