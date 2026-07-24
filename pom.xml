@@ -32,7 +32,7 @@
         <flyway.version>10.15.0</flyway.version>
 
         <!-- JDBC -->
-        <postgresql.version>42.7.3</postgresql.version>
+        <postgresql.version>42.7.12</postgresql.version>
 
         <!-- Hibernate 6 — bundled in WAR (Payara default is EclipseLink) -->
         <hibernate.version>6.6.8.Final</hibernate.version>
@@ -42,8 +42,8 @@
         <logback.version>1.4.14</logback.version>
 
         <!-- gRPC ML sidecar client  -->
-        <grpc.version>1.64.0</grpc.version>
-        <protobuf.version>3.25.3</protobuf.version>
+        <grpc.version>1.75.0</grpc.version>
+        <protobuf.version>3.25.8</protobuf.version>
 
         <!-- Test -->
         <junit5.version>5.10.3</junit5.version>
@@ -209,10 +209,13 @@
     </dependencies>
     <dependencyManagement>
         <dependencies>
+            <!-- Pin the whole Jackson stack (core/databind/annotations) to a CVE-free line -->
             <dependency>
-                <groupId>com.fasterxml.jackson.core</groupId>
-                <artifactId>jackson-annotations</artifactId>
-                <version>2.15.2</version>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>2.18.8</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
