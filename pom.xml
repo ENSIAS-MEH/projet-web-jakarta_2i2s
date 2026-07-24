@@ -32,7 +32,7 @@
         <flyway.version>10.15.0</flyway.version>
 
         <!-- JDBC -->
-        <postgresql.version>42.7.11</postgresql.version>
+        <postgresql.version>42.7.12</postgresql.version>
 
         <!-- Hibernate 6 — bundled in WAR (Payara default is EclipseLink) -->
         <hibernate.version>6.6.8.Final</hibernate.version>
