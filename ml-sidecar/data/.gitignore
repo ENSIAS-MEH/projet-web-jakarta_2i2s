@@ -1,0 +1,3 @@
+# Raw dataset is downloaded on demand (see download_dataset.sh), never committed.
+PhiUSIIL_Phishing_URL_Dataset.csv
+*.zip
